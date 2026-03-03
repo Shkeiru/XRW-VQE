@@ -3,3 +3,4 @@ build/
 XRW-VQE_Mockup/
 .clangd_config/
 .cache/
+data/
