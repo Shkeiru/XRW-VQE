@@ -65,10 +65,10 @@ def main():
     with open(out_name, "w", encoding="utf-8") as f:
         json.dump(mapping_data, f, indent=2)
 
-    out_path = os.path.abspath(out_name)
-
-    # Only print the filepath to stdout for the C++ backend
-    print(out_path)
+    # Only print the filename to stdout for the C++ backend.
+    # The script runs in WSL, so os.path.abspath outputs a Linux-style path
+    # (/mnt/c/...), which the Windows C++ application cannot read.
+    print(out_name)
 
 
 if __name__ == "__main__":

@@ -235,15 +235,19 @@ double Simulation::evaluate_functional(const std::vector<double> &params,
     // Perform the matrix-vector multiplication to get the theoretical factors
     Eigen::VectorXcd calc_factors = data->integrals * rdm1_map;
 
-    //Computation of eta
-    double eta = 
-    ((calc_factors.cwiseAbs() * data->exp_factors.cwiseAbs()).cwiseQuotient(data->uncertainties).sum())/
-    (calc_factors.cwiseAbs2().cwiseQuotient(data->uncertainties).sum());
+    // Computation of eta
+    double eta =
+        ((calc_factors.cwiseAbs() * data->exp_factors.cwiseAbs())
+             .cwiseQuotient(data->uncertainties)
+             .sum()) /
+        (calc_factors.cwiseAbs2().cwiseQuotient(data->uncertainties).sum());
 
     // TODO: Here you will define how these calculated factors impact the total
-    double chi_squared = (eta * calc_factors.cwiseAbs() - data->exp_factors.cwiseAbs()).cwiseAbs2()
-                                                                                               .cwiseQuotient(data->uncertainties.cwiseAbs2())
-                                                                                               .sum();
+    double chi_squared =
+        (eta * calc_factors.cwiseAbs() - data->exp_factors.cwiseAbs())
+            .cwiseAbs2()
+            .cwiseQuotient(data->uncertainties.cwiseAbs2())
+            .sum();
     energy += chi_squared;
   }
 
@@ -256,7 +260,8 @@ double Simulation::cost_function(const std::vector<double> &params,
   VQEData *data = static_cast<VQEData *>(data_ptr);
 
   // 1. Calculate the energy of the current point on the main register
-  double base_energy = evaluate_functional(params, data, data->qubits, data->current_1rdm);
+  double base_energy =
+      evaluate_functional(params, data, data->qubits, data->current_1rdm);
 
   // 2. Calculate the local gradients using Parameter Shift Rule (PSR)
   // ONLY if requested by the optimizer
@@ -280,13 +285,13 @@ double Simulation::cost_function(const std::vector<double> &params,
 
         // Shift +π/2
         shifted_params[i] = params[i] + M_PI / 2.0;
-        double e_plus = evaluate_functional(shifted_params, data,
-                                            local_qubits, rdm1_plus);
+        double e_plus =
+            evaluate_functional(shifted_params, data, local_qubits, rdm1_plus);
 
         // Shift -π/2
         shifted_params[i] = params[i] - M_PI / 2.0;
-        double e_minus = evaluate_functional(shifted_params, data,
-                                             local_qubits, rdm1_minus);
+        double e_minus =
+            evaluate_functional(shifted_params, data, local_qubits, rdm1_minus);
 
         // Parameter Shift Rule formula
         grad[i] = 0.5 * (e_plus - e_minus);
@@ -365,7 +370,8 @@ double
 Simulation::run(std::vector<double> &optimal_params,
                 std::function<void(int, double, const std::vector<double> &,
                                    const std::vector<double> &)>
-                    callback) {
+                    callback,
+                const std::string &fcalc_path, const std::string &ft_int_path) {
 
   // Retrieve the Hamiltonian in QuEST format
   PauliStrSum ham = physics.get_quest_hamiltonian();
@@ -438,15 +444,19 @@ Simulation::run(std::vector<double> &optimal_params,
   //----------------------------------------------------------------------------
   // 1-RDM Generation & Extraction
   //----------------------------------------------------------------------------
+  std::map<std::pair<int, int>, int> rdm1_index_map;
   try {
-    std::string cmd =
-        "python src/scripts/generate_1rdm.py --n_qubits " +
+    std::string command;
+#ifdef _WIN32
+    command = "wsl ";
+#endif
+    command += "python3 python/generate_1rdm.py --n_qubits " +
         std::to_string(physics.get_num_qubits()) +
         " --mapping jordan_wigner"; // assuming JW for now, could be dynamic
 
-    spdlog::info("[Simulation] Generating 1-RDM mapping: {}", cmd);
+    spdlog::info("[Simulation] Generating 1-RDM mapping: {}", command);
 
-    FILE *pipe = _popen(cmd.c_str(), "r");
+    FILE *pipe = _popen(command.c_str(), "r");
     if (!pipe) {
       throw std::runtime_error("_popen() failed!");
     }
@@ -494,8 +504,10 @@ Simulation::run(std::vector<double> &optimal_params,
       rdm_map[pq_pair].coeffs.push_back({c_real, c_imag});
     }
 
+    int current_idx = 0;
     for (auto &pair : rdm_map) {
       data.rdm1_operators.push_back(pair.second);
+      rdm1_index_map[{pair.second.p, pair.second.q}] = current_idx++;
     }
 
     spdlog::info(
@@ -528,19 +540,84 @@ Simulation::run(std::vector<double> &optimal_params,
 
   optimizer.set_min_objective(cost_function, &data);
 
-  // --- Allocating Dummy Diffraction Data ---
-  int M = 100000;
+  // --- Allocating Diffraction Data ---
   int N_rdm = data.rdm1_operators.size();
-  spdlog::info("[Simulation] Allocating Eigen dummy matrices for diffraction "
-               "data (M={}, N_rdm={})",
-               M, N_rdm);
+  int n_orbs = physics.get_num_qubits() / 2;
 
-  if (N_rdm > 0) {
-    data.integrals =
-        Eigen::MatrixXcd::Constant(M, N_rdm, std::complex<double>(1.0, 1.0));
-    data.exp_factors =
-        Eigen::VectorXcd::Constant(M, std::complex<double>(1.0, 1.0));
-    data.uncertainties = Eigen::VectorXd::Constant(M, 1.0);
+  if (N_rdm > 0 && !fcalc_path.empty() && !ft_int_path.empty()) {
+    spdlog::info("[Simulation] Loading diffraction data from {} and {}",
+                 fcalc_path, ft_int_path);
+
+    // 1. Read fcalc
+    std::vector<double> exp_F;
+    std::vector<double> exp_sigma;
+    std::ifstream fcalc_file(fcalc_path);
+    if (!fcalc_file.is_open()) {
+      spdlog::error("Could not open fcalc file!");
+    } else {
+      std::string line;
+      while (std::getline(fcalc_file, line)) {
+        if (line.empty() || line[0] == '#')
+          continue;
+        std::stringstream ss(line);
+        int h, k, l;
+        double f_obs, sigma;
+        if (ss >> h >> k >> l >> f_obs >> sigma) {
+          exp_F.push_back(f_obs);
+          exp_sigma.push_back(sigma);
+        }
+      }
+    }
+
+    int M = exp_F.size();
+    spdlog::info("[Simulation] Parsed {} reflections from fcalc", M);
+
+    data.exp_factors.resize(M);
+    data.uncertainties.resize(M);
+    for (int i = 0; i < M; ++i) {
+      data.exp_factors(i) = std::complex<double>(exp_F[i], 0.0);
+      data.uncertainties(i) = exp_sigma[i];
+    }
+
+    // 2. Read ft_int
+    data.integrals = Eigen::MatrixXcd::Zero(M, N_rdm);
+    std::ifstream ft_int_file(ft_int_path);
+    if (!ft_int_file.is_open()) {
+      spdlog::error("Could not open ft_int file!");
+    } else {
+      std::string line;
+      int line_count = 0;
+      int total_orbs_expected = n_orbs * n_orbs;
+
+      while (std::getline(ft_int_file, line)) {
+        if (line.empty() || line[0] == '#')
+          continue;
+        std::stringstream ss(line);
+        int p_file, q_file;
+        double real_val, imag_val;
+        if (ss >> p_file >> q_file >> real_val >> imag_val) {
+          int ref_idx = line_count / total_orbs_expected;
+          if (ref_idx < M) {
+            // Convert to 0-indexed values
+            int p_0 = p_file - 1;
+            int q_0 = q_file - 1;
+
+            auto it = rdm1_index_map.find({p_0, q_0});
+            if (it != rdm1_index_map.end()) {
+              int rdm_idx = it->second;
+              data.integrals(ref_idx, rdm_idx) =
+                  std::complex<double>(real_val, imag_val);
+            }
+          }
+          line_count++;
+        }
+      }
+      spdlog::info("[Simulation] Loaded ft_int file ({} lines processed).",
+                   line_count);
+    }
+  } else {
+    spdlog::info(
+        "[Simulation] No valid diffraction files specified or N_rdm == 0.");
   }
 
   double min_energy = 0.0;

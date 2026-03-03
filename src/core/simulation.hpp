@@ -134,12 +134,16 @@ public:
    *
    * @param optimal_params Output vector for the best found parameters.
    * @param callback Optional callback for iteration updates.
+   * @param fcalc_path Path to the experimental factors file.
+   * @param ft_int_path Path to the theoretical integrals file.
    * @return double The minimum energy found.
    */
   double run(std::vector<double> &optimal_params,
              std::function<void(int, double, const std::vector<double> &,
                                 const std::vector<double> &)>
-                 callback = nullptr);
+                 callback = nullptr,
+             const std::string &fcalc_path = "",
+             const std::string &ft_int_path = "");
 
   //----------------------------------------------------------------------------
   //     CONFIGURATION

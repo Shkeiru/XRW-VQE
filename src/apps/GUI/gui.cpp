@@ -344,10 +344,10 @@ void GUI::DrawConfiguration() {
           // 4. Run Optimization
           std::vector<double> params(ansatz->get_num_params(), 0.1);
 
-          double min_energy =
-              sim.run(params, [this](int iter, double energy,
-                                     const std::vector<double> &probs,
-                                     const std::vector<double> &cb_params) {
+          double min_energy = sim.run(
+              params,
+              [this](int iter, double energy, const std::vector<double> &probs,
+                     const std::vector<double> &cb_params) {
                 std::lock_guard<std::mutex> lock(graph_mutex);
                 iter_history.push_back((double)iter);
                 energy_history.push_back(energy);
@@ -358,7 +358,8 @@ void GUI::DrawConfiguration() {
                 current_iter = iter;
                 if (energy < best_energy)
                   best_energy = energy;
-              });
+              },
+              factors_path, integrals_path);
 
           // 5. Update Status with Noise Results (if any)
           try {
