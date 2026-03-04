@@ -243,7 +243,6 @@ double Simulation::evaluate_functional(const std::vector<double> &params,
                       .cwiseQuotient(data->uncertainties.cwiseAbs2())
                       .sum());
 
-    // TODO: Here you will define how these calculated factors impact the total
     double chi_squared =
         (1.0 / data->exp_factors.size()) *
         (eta * calc_factors.cwiseAbs() - data->exp_factors.cwiseAbs())

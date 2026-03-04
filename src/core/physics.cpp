@@ -12,12 +12,12 @@
 //     INCLUDES
 //------------------------------------------------------------------------------
 
-#define _CRT_SECURE_NO_WARNINGS
-
 #include "physics.hpp"
+#include "compat.h"
 #include <cstdio>
 #include <iostream>
 #include <sstream>
+
 
 //------------------------------------------------------------------------------
 //     CONSTRUCTOR

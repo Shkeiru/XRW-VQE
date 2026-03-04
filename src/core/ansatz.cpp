@@ -19,7 +19,6 @@
 #include <spdlog/spdlog.h>
 #include <vector>
 
-
 #include <algorithm>
 #define _USE_MATH_DEFINES
 #include <cmath>
@@ -184,8 +183,8 @@ UCCSD::UCCSD(int num_qubits, int num_electrons, std::string mapping)
       const auto &exc = excitations[k];
 
       for (const auto &term : exc.terms) {
-        // Parsing sale (mais on s'en fout, on ne le fait qu'une fois !)
-        std::vector<int> codes(num_qubits, 0); // 0=I
+        // Parse Pauli strings into dense qubit operations (0:I, 1:X, 2:Y, 3:Z)
+        std::vector<int> codes(num_qubits, 0);
         std::stringstream ss(term.pauli);
         std::string segment;
 
@@ -333,10 +332,8 @@ void UCCSD::construct_circuit(Qureg qubits, const std::vector<double> &params,
     return;
   }
 
-  // 1. Initialisation Hartree-Fock brute
-  /*for (int i = 0; i < num_electrons; ++i) {
-          applyPauliX(qubits, i);
-  }*/ //Deja present dans la simu, on l'enleve pour eviter les erreurs
+  // 1. Initialisation Hartree-Fock brute est deja deleguee au layer superieur
+  // (Simulation::run)
 
   // 2. Déroulage de la Bande Magnétique (Vitesse maximale !)
   const double PI = 3.14159265358979323846;
