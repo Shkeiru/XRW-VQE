@@ -245,6 +245,10 @@ void GUI::DrawConfiguration() {
   ImGui::TextWrapped("%s", filepath_factors.empty() ? "Aucun"
                                                     : filepath_factors.c_str());
 
+  ImGui::Spacing();
+  ImGui::Text("Facteur Lambda (Diffraction):");
+  ImGui::InputDouble("##lambda", &lambda_diffraction, 0.0, 0.0, "%.2f");
+
   // Maj du statut global de diffraction
   is_diffraction_ready =
       (!filepath_integrals.empty() && !filepath_factors.empty());
@@ -311,10 +315,12 @@ void GUI::DrawConfiguration() {
       std::string integrals_path =
           is_diffraction_ready ? filepath_integrals : "";
       std::string factors_path = is_diffraction_ready ? filepath_factors : "";
+      double current_lambda = lambda_diffraction;
 
       calculation_thread = std::thread([this, selected_algo, current_ansatz_idx,
                                         current_depth, current_map,
-                                        integrals_path, factors_path]() {
+                                        integrals_path, factors_path,
+                                        current_lambda]() {
         try {
           // 1. Load Physics
           Physics physics("hamiltonian.json");
@@ -340,6 +346,7 @@ void GUI::DrawConfiguration() {
           sim.set_max_evals(max_iter);
           sim.set_tolerance(tolerance);
           sim.set_shots(shots);
+          sim.set_lambda(current_lambda);
 
           // 4. Run Optimization
           std::vector<double> params(ansatz->get_num_params(), 0.1);

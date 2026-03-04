@@ -236,19 +236,21 @@ double Simulation::evaluate_functional(const std::vector<double> &params,
     Eigen::VectorXcd calc_factors = data->integrals * rdm1_map;
 
     // Computation of eta
-    double eta =
-        ((calc_factors.cwiseAbs() * data->exp_factors.cwiseAbs())
-             .cwiseQuotient(data->uncertainties)
-             .sum()) /
-        (calc_factors.cwiseAbs2().cwiseQuotient(data->uncertainties).sum());
+    double eta = ((calc_factors.cwiseAbs() * data->exp_factors.cwiseAbs())
+                      .cwiseQuotient(data->uncertainties.cwiseAbs2())
+                      .sum()) /
+                 (calc_factors.cwiseAbs2()
+                      .cwiseQuotient(data->uncertainties.cwiseAbs2())
+                      .sum());
 
     // TODO: Here you will define how these calculated factors impact the total
     double chi_squared =
+        (1.0 / data->exp_factors.size()) *
         (eta * calc_factors.cwiseAbs() - data->exp_factors.cwiseAbs())
             .cwiseAbs2()
             .cwiseQuotient(data->uncertainties.cwiseAbs2())
             .sum();
-    energy += chi_squared;
+    energy += data->lambda * chi_squared;
   }
 
   return energy;
@@ -391,6 +393,7 @@ Simulation::run(std::vector<double> &optimal_params,
                physics.get_n_electrons(),
                physics.get_num_qubits(),
                n_shots,
+               lambda_val,
                &last_variance,
                &last_std};
 
@@ -450,7 +453,8 @@ Simulation::run(std::vector<double> &optimal_params,
 #ifdef _WIN32
     command = "wsl ";
 #endif
-    command += "python3 python/generate_1rdm.py --n_qubits " +
+    command +=
+        "python3 python/generate_1rdm.py --n_qubits " +
         std::to_string(physics.get_num_qubits()) +
         " --mapping jordan_wigner"; // assuming JW for now, could be dynamic
 
@@ -668,6 +672,12 @@ void Simulation::set_tolerance(double tol) { optimizer.set_ftol_rel(tol); }
  * @param shots Number of measurement shots (0 for exact simulation).
  */
 void Simulation::set_shots(int shots) { n_shots = shots; }
+
+/**
+ * @brief Sets the scaling factor for the diffraction penalty.
+ * @param lambda Scaling factor value.
+ */
+void Simulation::set_lambda(double lambda) { lambda_val = lambda; }
 
 //------------------------------------------------------------------------------
 //     STATISTICS & HELPER METHODS

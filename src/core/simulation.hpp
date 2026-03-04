@@ -66,6 +66,7 @@ struct VQEData {
   int n_electrons = 0;  ///< Number of electrons in the system.
   int num_qubits = 0;   ///< Number of qubits.
   int n_shots = 0;      ///< Number of shots for noise simulation.
+  double lambda = 1.0;  ///< Scaling factor for diffraction penalty.
 
   double *variance_ptr = nullptr; ///< Pointer to store energy variance.
   double *std_ptr = nullptr; ///< Pointer to store energy standard deviation.
@@ -167,6 +168,12 @@ public:
    */
   void set_shots(int shots);
 
+  /**
+   * @brief Sets the scaling factor for the diffraction penalty.
+   * @param lambda Scaling factor value (default 1.0).
+   */
+  void set_lambda(double lambda);
+
   //----------------------------------------------------------------------------
   //     STATISTICS & RESULTS
   //----------------------------------------------------------------------------
@@ -201,6 +208,7 @@ private:
   nlopt::opt optimizer; ///< Classical optimizer.
 
   int n_shots = 0;            ///< configured number of shots.
+  double lambda_val = 1.0;    ///< configured diffraction scaling factor.
   double last_variance = 0.0; ///< Last computed variance.
   double last_std = 0.0;      ///< Last computed standard deviation.
 

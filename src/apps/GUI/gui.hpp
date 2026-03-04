@@ -19,7 +19,6 @@
 #include <thread>
 #include <vector>
 
-
 //------------------------------------------------------------------------------
 //     CLASS DECLARATION
 //------------------------------------------------------------------------------
@@ -129,6 +128,7 @@ private:
   std::string filepath_integrals = ""; ///< Path to integrals file
   std::string filepath_factors = "";   ///< Path to experimental factors file
   bool is_diffraction_ready = false;   ///< Flag if both files are selected
+  double lambda_diffraction = 1.0; ///< Scaling factor for diffraction penalty
 
   //----------------------------------------------------------------------------
   //     DATA MEMBERS - NLOPT
