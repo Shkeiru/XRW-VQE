@@ -15,7 +15,7 @@
 #define _USE_MATH_DEFINES
 #include "simulation.hpp"
 #include "compat.h"
-#include <QuEST.h>
+#include <quest.h>
 #include <bitset>
 #include <cmath>
 #include <complex>
