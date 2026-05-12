@@ -447,7 +447,7 @@ int main(int argc, char **argv) {
       //   entry["probabilities"] = probs_history[i];
 
       // On garde les parametres uniquement pour l'iteration finale
-      if (i == iter_history.size() - 1) {
+      if (i == iter_history.size() - 2) { //there's a mess with the very final iteration, take the previous one
         if (i < params_history.size())
           entry["parameters"] = params_history[i];
       }
@@ -456,8 +456,8 @@ int main(int argc, char **argv) {
     j["history"] = history_arr;
 
     // j["state"]["probabilities"] = counts_values;
-
-    std::vector<std::string> labels;
+    // skip that part because of the high line count
+    /*std::vector<std::string> labels;
     int n_q = 0;
     if (counts_values.size() > 0)
       n_q = (int)std::log2(counts_values.size());
@@ -468,7 +468,7 @@ int main(int argc, char **argv) {
       }
       labels.push_back(bitstring);
     }
-    j["state"]["labels"] = labels;
+    j["state"]["labels"] = labels;*/
 
     j["system"] = {{"simulator", "XRW-VQE Simulator C++ v1.0"},
                    {"num_qubits", num_qubits},
