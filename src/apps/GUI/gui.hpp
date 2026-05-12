@@ -208,6 +208,9 @@ private:
   int ansatz_idx = 0;       ///< Selected ansatz index.
   std::vector<const char *> ansatz_types = {"HEA", "UCCSD"};
 
+  bool use_warm_start = false;           ///< Flag to enable warm start.
+  std::string filepath_warm_start = "";  ///< Path to warm start JSON file.
+
   //----------------------------------------------------------------------------
   //     DATA MEMBERS - CONCURRENCY
   //----------------------------------------------------------------------------

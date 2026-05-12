@@ -145,6 +145,11 @@ int main(int argc, char **argv) {
   std::string opt_out = "";
   app.add_option("--out", opt_out, "Explicit path for JSON output file");
 
+  // Warm start options
+  std::string opt_warm_start = "";
+  app.add_option("--warm-start", opt_warm_start,
+                 "Path to warm start parameters JSON file");
+
   CLI11_PARSE(app, argc, argv);
 
   try {
@@ -241,9 +246,15 @@ int main(int argc, char **argv) {
       return EXIT_FAILURE;
     }
 
-    // 4. Create Simulation
+    // 4. Create VQEContext
+    VQEContext ctx(physics, *ansatz);
+    ctx.n_shots = opt_shots;
+    ctx.lambda = opt_lambda;
+    ctx.setup(opt_factors, opt_integrals);
+
+    // 5. Create Simulation
     nlopt::algorithm algo = get_nlopt_algorithm(opt_optimizer);
-    Simulation sim(physics, *ansatz, algo);
+    Simulation sim(ctx, algo);
 
     if (opt_optimizer == "SPSA") {
       sim.set_optimizer_type(Simulation::OptType::SPSA);
@@ -260,8 +271,6 @@ int main(int argc, char **argv) {
 
     sim.set_max_evals(opt_max_iter);
     sim.set_tolerance(opt_tolerance);
-    sim.set_shots(opt_shots);
-    sim.set_lambda(opt_lambda);
 
     // Required history arrays
     std::vector<double> iter_history;
@@ -309,11 +318,74 @@ int main(int argc, char **argv) {
     spdlog::info(">>> Starting XRW-VQE... (Simulation)");
     std::vector<double> params(ansatz->get_num_params(), 0);
 
+    // --- Warm Start: Load parameters from file if provided ---
+    if (!opt_warm_start.empty()) {
+      std::ifstream ws_file(opt_warm_start);
+      if (!ws_file.good()) {
+        spdlog::critical("Warm start file not found: {}", opt_warm_start);
+        finalizeQuESTEnv();
+        return EXIT_FAILURE;
+      }
+
+      nlohmann::json ws_json;
+      ws_file >> ws_json;
+
+      // Validate ansatz tag
+      auto tag = ws_json["ansatz_tag"];
+      std::string ws_type = tag["type"].get<std::string>();
+      int ws_nq = tag["num_qubits"].get<int>();
+
+      if (ws_type != opt_ansatz) {
+        spdlog::critical(
+            "Warm start ansatz mismatch: file={}, current={}", ws_type,
+            opt_ansatz);
+        finalizeQuESTEnv();
+        return EXIT_FAILURE;
+      }
+      if (ws_nq != num_qubits) {
+        spdlog::critical(
+            "Warm start num_qubits mismatch: file={}, current={}", ws_nq,
+            num_qubits);
+        finalizeQuESTEnv();
+        return EXIT_FAILURE;
+      }
+      if (ws_type == "HEA" &&
+          tag["depth"].get<int>() != opt_hea_depth) {
+        spdlog::critical("Warm start HEA depth mismatch: file={}, current={}",
+                         tag["depth"].get<int>(), opt_hea_depth);
+        finalizeQuESTEnv();
+        return EXIT_FAILURE;
+      }
+      if (ws_type == "UCCSD" &&
+          tag["num_electrons"].get<int>() !=
+              physics.get_n_electrons()) {
+        spdlog::critical(
+            "Warm start UCCSD num_electrons mismatch: file={}, current={}",
+            tag["num_electrons"].get<int>(), physics.get_n_electrons());
+        finalizeQuESTEnv();
+        return EXIT_FAILURE;
+      }
+
+      // Validate parameter count
+      auto ws_params = ws_json["parameters"].get<std::vector<double>>();
+      if ((int)ws_params.size() != ansatz->get_num_params()) {
+        spdlog::critical(
+            "Warm start params size mismatch: file={}, expected={}",
+            ws_params.size(), ansatz->get_num_params());
+        finalizeQuESTEnv();
+        return EXIT_FAILURE;
+      }
+
+      params = ws_params;
+      spdlog::info("Warm start loaded: {} parameters from {}", params.size(),
+                   opt_warm_start);
+    }
+
     double noisy_energy = 0.0;
     std::string status_message = "XRW-VQE terminated.";
 
     try {
-      noisy_energy = sim.run(params, callback, opt_factors, opt_integrals);
+      noisy_energy = sim.run(params, callback);
 
       // Re-fetch final probabilities using the sim method for output
       counts_values = sim.get_probabilities(params);
@@ -425,6 +497,32 @@ int main(int argc, char **argv) {
     std::ofstream rdm_out(rdm_filename);
     rdm_out << std::setw(4) << sim.get_rdms() << std::endl;
     spdlog::info("RDMs saved to: {}", rdm_filename);
+
+    // --- Warm Start Export ---
+    {
+      nlohmann::json ws_json;
+      nlohmann::json tag;
+      tag["type"] = opt_ansatz;
+      tag["num_qubits"] = num_qubits;
+      if (opt_ansatz == "HEA") {
+        tag["depth"] = opt_hea_depth;
+      } else if (opt_ansatz == "UCCSD") {
+        tag["num_electrons"] = physics.get_n_electrons();
+      }
+      ws_json["ansatz_tag"] = tag;
+      ws_json["num_params"] = (int)params.size();
+      ws_json["parameters"] = params;
+
+      std::time_t ws_now = std::time(nullptr);
+      char ws_buf[100];
+      std::strftime(ws_buf, sizeof(ws_buf), "%Y%m%d_%H%M%S",
+                    std::localtime(&ws_now));
+      std::string ws_filename =
+          "warm_start_" + std::string(ws_buf) + ".json";
+      std::ofstream ws_out(ws_filename);
+      ws_out << std::setw(4) << ws_json << std::endl;
+      spdlog::info("Warm start saved to: {}", ws_filename);
+    }
 
     finalizeQuESTEnv();
 

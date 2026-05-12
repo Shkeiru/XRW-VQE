@@ -29,100 +29,7 @@
 //     STRUCTS
 //------------------------------------------------------------------------------
 
-/**
- * @struct RDM1Term
- * @brief Represents a single 1-Particle Reduced Density Matrix term
- * $a^\dagger_p a_q$.
- *
- * It contains the mapped Pauli strings and their complex coefficients.
- */
-struct RDM1Term {
-  int p;
-  int q;
-  std::vector<PauliStr> strings;
-  std::vector<qcomp> coeffs;
-};
-
-/**
- * @struct RDM2Term
- * @brief Represents a single 2-Particle Reduced Density Matrix term
- * $a^\dagger_p a^\dagger_q a_r a_s$.
- *
- * It contains the mapped Pauli strings and their complex coefficients.
- */
-struct RDM2Term {
-  int p;
-  int q;
-  int r;
-  int s;
-  std::vector<PauliStr> strings;
-  std::vector<qcomp> coeffs;
-};
-
-/**
- * @struct VQEData
- * @brief Data structure passed to the cost function during optimization.
- *
- * Contains references to the system components (Ansatz, Physics, Qubits)
- * and runtime parameters required for energy evaluation and callback execution.
- */
-struct VQEData {
-  Ansatz &ansatz;           ///< Reference to the variational ansatz.
-  Qureg &qubits;            ///< Reference to the QuEST quantum register.
-  PauliStrSum &hamiltonian; ///< Reference to the Hamiltonian structure.
-
-  const std::vector<std::string> &paulis; ///< List of Pauli strings.
-
-  Physics &physics; ///< Reference to Physics object (needed for noise sim).
-
-  ///< Callback function for real-time updates (iter, total_energy,
-  ///< quantum_energy, chi_squared, probs, params).
-  std::function<void(int, double, double, double, const std::vector<double> &,
-                     const std::vector<double> &)>
-      callback;
-
-  int current_iter = 0; ///< Current iteration counter.
-  int n_electrons = 0;  ///< Number of electrons in the system.
-  int num_qubits = 0;   ///< Number of qubits.
-  int n_shots = 0;      ///< Number of shots for noise simulation.
-  double lambda = 1.0;  ///< Scaling factor for diffraction penalty.
-
-  double *variance_ptr = nullptr; ///< Pointer to store energy variance.
-  double *std_ptr = nullptr; ///< Pointer to store energy standard deviation.
-
-  PauliStrSum number_penalty_op; ///< Penalty operator (N - N_target)^2 for particle number conservation.
-  bool has_number_penalty =
-      false; ///< Flag indicating if penalty operator is initialized.
-
-  PauliStrSum spin_penalty_op; ///< Penalty operator (S_z - target_S_z)^2 for spin projection conservation.
-  bool has_spin_penalty =
-      false; ///< Flag indicating if spin penalty operator is initialized.
-
-  std::vector<PauliStr>
-      parsed_paulis; ///< Pre-parsed QuEST Pauli strings for noisy sim.
-  std::vector<PauliStrSum>
-      single_term_sums; ///< Pre-allocated PauliStrSums for each term.
-
-  // 1-RDM terms
-  std::vector<RDM1Term>
-      rdm1_operators; ///< 1-RDM grouped Pauli strings and coefficients.
-  std::vector<qcomp>
-      current_1rdm; ///< Latest evaluated 1-RDM expectation values.
-
-  // Diffraction data (Eigen)
-  Eigen::VectorXcd rdm1_alpha;   ///< Alpha spin-orbital components
-  Eigen::VectorXcd rdm1_beta;    ///< Beta spin-orbital components
-  Eigen::VectorXcd rdm1_spatial; ///< Total spatial 1-RDM vector
-
-  Eigen::MatrixXcd
-      integrals; ///< Integral matrix for theoretically computed factors.
-  Eigen::VectorXcd exp_factors;  ///< Experimental factors for comparison.
-  Eigen::VectorXd uncertainties; ///< Experimental uncertainties.
-
-  // Debug: last computed eta and structure factors
-  double last_eta = 0.0;                    ///< Last computed scale factor η.
-  Eigen::VectorXd last_calc_factors_abs;    ///< Last computed |F_calc| array.
-};
+#include "vqe_context.hpp"
 
 //------------------------------------------------------------------------------
 //     CLASS DECLARATION
@@ -147,15 +54,14 @@ public:
   /**
    * @brief Constructs a Simulation object.
    *
-   * @param physics Reference to the Physics object.
-   * @param ansatz Reference to the Ansatz object.
+   * @param context Reference to the VQEContext object.
    * @param algo The optimization algorithm to use (default: Nelder-Mead).
    */
-  Simulation(Physics &physics, Ansatz &ansatz,
+  Simulation(VQEContext &context,
              nlopt::algorithm algo = nlopt::LN_NELDERMEAD);
 
   /**
-   * @brief Destructor. Cleans up quantum resources.
+   * @brief Destructor.
    */
   ~Simulation();
 
@@ -168,17 +74,13 @@ public:
    *
    * @param optimal_params Output vector for the best found parameters.
    * @param callback Optional callback for iteration updates.
-   * @param fcalc_path Path to the experimental factors file.
-   * @param ft_int_path Path to the theoretical integrals file.
    * @return double The minimum energy found.
    */
   double run(std::vector<double> &optimal_params,
              std::function<void(int, double, double, double,
                                 const std::vector<double> &,
                                 const std::vector<double> &)>
-                 callback = nullptr,
-             const std::string &fcalc_path = "",
-             const std::string &ft_int_path = "");
+                 callback = nullptr);
 
   //----------------------------------------------------------------------------
   //     CONFIGURATION
@@ -195,18 +97,6 @@ public:
    * @param tol Tolerance value (e.g., 1e-8).
    */
   void set_tolerance(double tol);
-
-  /**
-   * @brief Sets the number of shots for noisy simulation.
-   * @param shots Number of shots (0 for exact simulation).
-   */
-  void set_shots(int shots);
-
-  /**
-   * @brief Sets the scaling factor for the diffraction penalty.
-   * @param lambda Scaling factor value (default 1.0).
-   */
-  void set_lambda(double lambda);
 
   /**
    * @brief Sets the optimizer type to use.
@@ -254,15 +144,11 @@ private:
   //     PRIVATE MEMBERS
   //----------------------------------------------------------------------------
 
-  Physics &physics;     ///< System physics model.
-  Ansatz &ansatz;       ///< Quantum circuit ansatz.
-  Qureg qubits;         ///< QuEST quantum register.
+  VQEContext &ctx;     ///< Reference to the VQE context.
   nlopt::opt optimizer; ///< Classical optimizer.
   SPSA_Optimizer spsa_optimizer; ///< SPSA optimizer.
   OptType opt_type_ = OptType::NLOPT; ///< Current optimizer type.
 
-  int n_shots = 0;            ///< configured number of shots.
-  double lambda_val = 1.0;    ///< configured diffraction scaling factor.
   double last_variance = 0.0; ///< Last computed variance.
   double last_std = 0.0;      ///< Last computed standard deviation.
 
@@ -277,7 +163,7 @@ private:
    *
    * @param params Current parameters.
    * @param grad Gradient vector (if supported).
-   * @param data Pointer to VQEData struct.
+   * @param data Pointer to VQEContext struct.
    * @return double Energy value (to be minimized).
    */
   static double cost_function(const std::vector<double> &params,
@@ -288,7 +174,7 @@ private:
    * set of parameters.
    *
    * @param params Current parameters.
-   * @param data Pointer to VQEData struct.
+   * @param data Pointer to VQEContext struct.
    * @param local_qubits The quantum register to use for evaluation.
    * @param rdm1_out Vector to store the output 1-RDM evaluations.
    * @param out_quantum_energy Optional pointer to store extracted quantum
@@ -298,7 +184,7 @@ private:
    * @return double Calculated total energy value (including penalty).
    */
   static double evaluate_functional(const std::vector<double> &params,
-                                    VQEData *data, Qureg local_qubits,
+                                    VQEContext *data, Qureg local_qubits,
                                     std::vector<qcomp> &rdm1_out,
                                     double *out_quantum_energy = nullptr,
                                     double *out_chi_squared = nullptr);

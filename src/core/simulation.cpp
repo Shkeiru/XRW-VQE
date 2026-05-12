@@ -60,21 +60,15 @@ struct fast_xorshift64 {
 /**
  * @brief Constructs the Simulation object.
  *
- * Initializes the simulation environment, creates the quantum register (Qureg),
- * and configures the optimizer with default bounds and tolerance.
+ * Configures the optimizer with default bounds and tolerance.
  *
- * @param physics Reference to the Physics object containing system properties.
- * @param ansatz Reference to the Ansatz object defining the variational
- * circuit.
+ * @param context Reference to the VQEContext object.
  * @param algo The NLopt optimization algorithm to use.
  */
-Simulation::Simulation(Physics &physics, Ansatz &ansatz, nlopt::algorithm algo)
-    : physics(physics), ansatz(ansatz),
-      optimizer(algo, ansatz.get_num_params()),
-      spsa_optimizer(ansatz.get_num_params()) {
-
-  // Initialize the Quantum Entroypy format (QuEST) quantum register
-  qubits = createQureg(physics.get_num_qubits());
+Simulation::Simulation(VQEContext &context, nlopt::algorithm algo)
+    : ctx(context),
+      optimizer(algo, context.ansatz.get_num_params()),
+      spsa_optimizer(context.ansatz.get_num_params()) {
 
   // Configure the non-linear optimizer parameters
   optimizer.set_ftol_rel(1e-8);
@@ -82,11 +76,9 @@ Simulation::Simulation(Physics &physics, Ansatz &ansatz, nlopt::algorithm algo)
 }
 
 /**
- * @brief Destroys the Simulation object.
- *
- * Releases resources associated with the quantum register.
+ * @brief Destructor.
  */
-Simulation::~Simulation() { destroyQureg(qubits); }
+Simulation::~Simulation() {}
 
 //------------------------------------------------------------------------------
 //     COST FUNCTION
@@ -105,7 +97,7 @@ Simulation::~Simulation() { destroyQureg(qubits); }
  * @return double The estimated energy (cost) for the given parameters.
  */
 double Simulation::evaluate_functional(const std::vector<double> &params,
-                                       VQEData *data, Qureg local_qubits,
+                                       VQEContext *data, Qureg local_qubits,
                                        std::vector<qcomp> &rdm1_out,
                                        double *out_quantum_energy,
                                        double *out_chi_squared) {
@@ -297,7 +289,7 @@ double Simulation::evaluate_functional(const std::vector<double> &params,
 double Simulation::cost_function(const std::vector<double> &params,
                                  std::vector<double> &grad, void *data_ptr) {
 
-  VQEData *data = static_cast<VQEData *>(data_ptr);
+  VQEContext *data = static_cast<VQEContext *>(data_ptr);
 
   double current_quantum_energy = 0.0;
   double current_chi_squared = 0.0;
@@ -394,6 +386,7 @@ double Simulation::cost_function(const std::vector<double> &params,
   return base_energy;
 }
 
+
 //------------------------------------------------------------------------------
 //     EXECUTION
 //------------------------------------------------------------------------------
@@ -405,343 +398,30 @@ double Simulation::cost_function(const std::vector<double> &params,
  * optimizer.
  *
  * @param optimal_params Output vector to store the optimized parameters.
- * @param callback Function to be called at each iteration (step, energy,
- * probabilities).
+ * @param callback Function to be called at each iteration (step, energy, probabilities).
  * @return double The minimum energy found after optimization.
  */
 double Simulation::run(
     std::vector<double> &optimal_params,
     std::function<void(int, double, double, double, const std::vector<double> &,
                        const std::vector<double> &)>
-        callback,
-    const std::string &fcalc_path, const std::string &ft_int_path) {
-
-  // Retrieve the Hamiltonian in QuEST format
-  PauliStrSum ham = physics.get_quest_hamiltonian();
+        callback) {
 
   // Initialize VQE data context for the cost function
-  spdlog::info("[Simulation] Starting VQE Optimization with {} params and max "
-               "{} evaluations",
-               ansatz.get_num_params(), optimizer.get_maxeval());
+  spdlog::info("[Simulation] Starting VQE Optimization with {} params and max {} evaluations",
+               ctx.ansatz.get_num_params(), optimizer.get_maxeval());
 
-  VQEData data{ansatz,
-               qubits,
-               ham,
-               physics.get_pauli_strings(),
-               physics,
-               callback,
-               0,
-               physics.get_n_electrons(),
-               physics.get_num_qubits(),
-               n_shots,
-               lambda_val,
-               &last_variance,
-               &last_std};
+  ctx.callback = callback;
+  ctx.current_iter = 0;
+  ctx.variance_ptr = &last_variance;
+  ctx.std_ptr = &last_std;
 
   // Reset statistical trackers
   last_variance = 0.0;
   last_std = 0.0;
 
-  // Pre-parse Pauli strings for noisy simulation to avoid parsing overhead in
-  // the cost function
-  std::vector<PauliStr> parsed_paulis;
-  const auto &pauli_strings = physics.get_pauli_strings();
-  parsed_paulis.reserve(pauli_strings.size());
-
-  for (const auto &s : pauli_strings) {
-    PauliStr pStr;
-    if (s == "I") {
-      std::vector<int> idx = {0};
-      pStr = getPauliStr("I", idx);
-    } else {
-      std::string codes;
-      std::vector<int> idx;
-      std::stringstream ss(s);
-      std::string token;
-      while (ss >> token) {
-        if (token.length() < 2)
-          continue;
-        codes += token[0];
-        idx.push_back(std::stoi(token.substr(1)));
-      }
-      if (codes.empty()) {
-        std::vector<int> z = {0};
-        pStr = getPauliStr("I", z);
-      } else {
-        pStr = getPauliStr(codes, idx);
-      }
-    }
-    parsed_paulis.push_back(pStr);
-  }
-  data.parsed_paulis = parsed_paulis;
-
-  // Pre-calculate individual PauliStr sums for noisy simulations
-  std::vector<PauliStrSum> single_sums;
-  single_sums.reserve(parsed_paulis.size());
-  for (const auto &pStr : parsed_paulis) {
-    qcomp one = 1.0;
-    PauliStr terms_arr[] = {pStr};
-    single_sums.push_back(createPauliStrSum(terms_arr, &one, 1));
-  }
-  data.single_term_sums = single_sums;
-
-  //----------------------------------------------------------------------------
-  // 1-RDM Generation & Extraction
-  //----------------------------------------------------------------------------
-  std::map<std::pair<int, int>, int> rdm1_index_map;
-  try {
-    std::string command;
-#ifdef _WIN32
-    command = "wsl ";
-#endif
-    command +=
-        "python3 python/generate_1rdm.py --n_qubits " +
-        std::to_string(physics.get_num_qubits()) +
-        " --mapping jordan_wigner"; // assuming JW for now, could be dynamic
-
-    spdlog::info("[Simulation] Generating 1-RDM mapping: {}", command);
-
-    FILE *pipe = _popen(command.c_str(), "r");
-    if (!pipe) {
-      throw std::runtime_error("_popen() failed!");
-    }
-
-    char buffer[256];
-    std::string json_filepath = "";
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-      json_filepath += buffer;
-    }
-    _pclose(pipe);
-
-    // Remove trailing newlines explicitly
-    json_filepath.erase(
-        std::remove(json_filepath.begin(), json_filepath.end(), '\n'),
-        json_filepath.end());
-    json_filepath.erase(
-        std::remove(json_filepath.begin(), json_filepath.end(), '\r'),
-        json_filepath.end());
-
-    std::ifstream f(json_filepath);
-    if (!f.is_open()) {
-      throw std::runtime_error("Could not open 1-RDM JSON file: " +
-                               json_filepath);
-    }
-
-    nlohmann::json rdm_json;
-    f >> rdm_json;
-
-    // Group identically (p,q) items
-    std::map<std::pair<int, int>, RDM1Term> rdm_map;
-
-    for (const auto &item : rdm_json) {
-      int p = item["p"];
-      int q = item["q"];
-      double c_real = item["coeff_real"];
-      double c_imag = item["coeff_imag"];
-      std::string pauli_string = item["string"];
-
-      std::pair<int, int> pq_pair = {p, q};
-      if (rdm_map.find(pq_pair) == rdm_map.end()) {
-        rdm_map[pq_pair] = {p, q, {}, {}};
-      }
-
-      rdm_map[pq_pair].strings.push_back(getPauliStr(pauli_string));
-      rdm_map[pq_pair].coeffs.push_back({c_real, c_imag});
-    }
-
-    int current_idx = 0;
-    for (auto &pair : rdm_map) {
-      data.rdm1_operators.push_back(pair.second);
-      rdm1_index_map[{pair.second.p, pair.second.q}] = current_idx++;
-    }
-
-    spdlog::info(
-        "[Simulation] Successfully parsed {} operator groups for 1-RDM",
-        data.rdm1_operators.size());
-
-  } catch (const std::exception &e) {
-    spdlog::error("[Simulation] Failed to generate/parse 1-RDM: {}", e.what());
-    // Depending on rules, you could rethrow or continue without 1-RDM logging.
-  }
-
-  if (!ansatz.preserves_particle_number()) {
-    int N_q = physics.get_num_qubits();
-    double C = N_q / 2.0 - physics.get_n_electrons();
-    
-    int total_terms = 1 + N_q + (N_q * (N_q - 1)) / 2;
-    std::vector<PauliStr> terms(total_terms);
-    std::vector<qcomp> coeffs(total_terms, 0.0);
-    
-    std::string identity = std::string(N_q, 'I');
-    
-    // 1. Identity term
-    terms[0] = getPauliStr(identity);
-    coeffs[0] = C * C + N_q / 4.0;
-    
-    int idx = 1;
-    // 2. Single Z terms
-    for (int i = 0; i < N_q; ++i) {
-      std::string term = identity;
-      term[i] = 'Z';
-      terms[idx] = getPauliStr(term);
-      coeffs[idx] = -C;
-      idx++;
-    }
-    
-    // 3. Double Z_i Z_j terms
-    for (int i = 0; i < N_q; ++i) {
-      for (int j = i + 1; j < N_q; ++j) {
-        std::string term = identity;
-        term[i] = 'Z';
-        term[j] = 'Z';
-        terms[idx] = getPauliStr(term);
-        coeffs[idx] = 0.5;
-        idx++;
-      }
-    }
-    
-    data.number_penalty_op = createPauliStrSum(terms.data(), coeffs.data(), total_terms);
-    data.has_number_penalty = true;
-  }
-
-  if (!ansatz.preserves_spin()) {
-    int N_q = physics.get_num_qubits();
-    int n_orbs = N_q / 2;
-    std::string identity = std::string(N_q, 'I');
-    std::map<std::string, double> s2_map;
-
-    // 1. Termes diagonaux (k = l)
-    for (int k = 0; k < n_orbs; ++k) {
-        s2_map[identity] += 3.0 / 8.0;
-        
-        std::string term = identity;
-        term[2*k] = 'Z'; 
-        term[2*k+1] = 'Z';
-        s2_map[term] -= 3.0 / 8.0;
-    }
-
-    // 2. Termes croisés (k < l)
-    for (int k = 0; k < n_orbs; ++k) {
-        for (int l = k + 1; l < n_orbs; ++l) {
-            std::string t;
-            
-            // Composantes Sz * Sz
-            t = identity; t[2*k+1] = 'Z'; t[2*l+1] = 'Z'; s2_map[t] += 1.0/8.0;
-            t = identity; t[2*k+1] = 'Z'; t[2*l] = 'Z';   s2_map[t] -= 1.0/8.0;
-            t = identity; t[2*k] = 'Z';   t[2*l+1] = 'Z'; s2_map[t] -= 1.0/8.0;
-            t = identity; t[2*k] = 'Z';   t[2*l] = 'Z';   s2_map[t] += 1.0/8.0;
-
-            // Composantes Sx * Sx
-            t = identity; t[2*k]='X'; t[2*k+1]='X'; t[2*l]='X'; t[2*l+1]='X'; s2_map[t] += 1.0/8.0;
-            t = identity; t[2*k]='X'; t[2*k+1]='X'; t[2*l]='Y'; t[2*l+1]='Y'; s2_map[t] += 1.0/8.0;
-            t = identity; t[2*k]='Y'; t[2*k+1]='Y'; t[2*l]='X'; t[2*l+1]='X'; s2_map[t] += 1.0/8.0;
-            t = identity; t[2*k]='Y'; t[2*k+1]='Y'; t[2*l]='Y'; t[2*l+1]='Y'; s2_map[t] += 1.0/8.0;
-
-            // Composantes Sy * Sy
-            t = identity; t[2*k]='X'; t[2*k+1]='Y'; t[2*l]='X'; t[2*l+1]='Y'; s2_map[t] += 1.0/8.0;
-            t = identity; t[2*k]='X'; t[2*k+1]='Y'; t[2*l]='Y'; t[2*l+1]='X'; s2_map[t] -= 1.0/8.0;
-            t = identity; t[2*k]='Y'; t[2*k+1]='X'; t[2*l]='X'; t[2*l+1]='Y'; s2_map[t] -= 1.0/8.0;
-            t = identity; t[2*k]='Y'; t[2*k+1]='X'; t[2*l]='Y'; t[2*l+1]='X'; s2_map[t] += 1.0/8.0;
-        }
-    }
-
-    // 3. Conversion propre en QuEST PauliStrSum
-    std::vector<PauliStr> s2_terms_vec;
-    std::vector<qcomp> s2_coeffs_vec;
-    for (const auto& kv : s2_map) {
-        if (std::abs(kv.second) > 1e-9) {
-            s2_terms_vec.push_back(getPauliStr(kv.first));
-            s2_coeffs_vec.push_back(kv.second); // Real coefficients
-        }
-    }
-    
-    data.spin_penalty_op = createPauliStrSum(s2_terms_vec.data(), s2_coeffs_vec.data(), s2_terms_vec.size());
-    data.has_spin_penalty = true;
-  }
-
-  optimizer.set_min_objective(cost_function, &data);
-  spsa_optimizer.set_min_objective(cost_function, &data);
-
-  // --- Allocating Diffraction Data ---
-  int N_rdm = data.rdm1_operators.size();
-  int n_orbs = physics.get_num_qubits() / 2;
-
-  if (N_rdm > 0 && !fcalc_path.empty() && !ft_int_path.empty()) {
-    spdlog::info("[Simulation] Loading diffraction data from {} and {}",
-                 fcalc_path, ft_int_path);
-
-    // 1. Read fcalc
-    std::vector<double> exp_F;
-    std::vector<double> exp_sigma;
-    std::ifstream fcalc_file(fcalc_path);
-    if (!fcalc_file.is_open()) {
-      spdlog::error("Could not open fcalc file!");
-    } else {
-      std::string line;
-      while (std::getline(fcalc_file, line)) {
-        if (line.empty() || line[0] == '#')
-          continue;
-        std::stringstream ss(line);
-        int h, k, l;
-        double f_obs, sigma;
-        if (ss >> h >> k >> l >> f_obs >> sigma) {
-          exp_F.push_back(f_obs);
-          exp_sigma.push_back(sigma);
-        }
-      }
-    }
-
-    int M = exp_F.size();
-    spdlog::info("[Simulation] Parsed {} reflections from fcalc", M);
-
-    data.exp_factors.resize(M);
-    data.uncertainties.resize(M);
-    for (int i = 0; i < M; ++i) {
-      data.exp_factors(i) = std::complex<double>(exp_F[i], 0.0);
-      data.uncertainties(i) = exp_sigma[i];
-    }
-
-    data.rdm1_alpha.resize(n_orbs * n_orbs);
-    data.rdm1_beta.resize(n_orbs * n_orbs);
-    data.rdm1_spatial.resize(n_orbs * n_orbs);
-
-    // 2. Read ft_int
-    data.integrals = Eigen::MatrixXcd::Zero(M, n_orbs * n_orbs);
-    std::ifstream ft_int_file(ft_int_path);
-    if (!ft_int_file.is_open()) {
-      spdlog::error("Could not open ft_int file!");
-    } else {
-      std::string line;
-      int line_count = 0;
-      int total_orbs_expected = n_orbs * n_orbs;
-
-      while (std::getline(ft_int_file, line)) {
-        if (line.empty() || line[0] == '#')
-          continue;
-        std::stringstream ss(line);
-        int p_file, q_file;
-        double real_val, imag_val;
-        if (ss >> p_file >> q_file >> real_val >> imag_val) {
-          int ref_idx = line_count / total_orbs_expected;
-          if (ref_idx < M) {
-            // Convert to 0-indexed values
-            int p_0 = p_file - 1;
-            int q_0 = q_file - 1;
-
-            int spatial_idx = p_0 * n_orbs + q_0;
-            data.integrals(ref_idx, spatial_idx) =
-                std::complex<double>(real_val, imag_val);
-          }
-          line_count++;
-        }
-      }
-      spdlog::info("[Simulation] Loaded ft_int file ({} lines processed).",
-                   line_count);
-    }
-  } else {
-    spdlog::info(
-        "[Simulation] No valid diffraction files specified or N_rdm == 0.");
-  }
+  optimizer.set_min_objective(cost_function, &ctx);
+  spsa_optimizer.set_min_objective(cost_function, &ctx);
 
   double min_energy = 0.0;
 
@@ -752,30 +432,27 @@ double Simulation::run(
     } else {
       result = spsa_optimizer.optimize(optimal_params, min_energy);
     }
-    spdlog::info("[Simulation] Optimization finished successfully - Result "
-                 "code: {}, Min Energy: {:.6f}",
+    spdlog::info("[Simulation] Optimization finished successfully - Result code: {}, Min Energy: {:.6f}",
                  (int)result, min_energy);
   } catch (const std::exception &e) {
-    spdlog::error("[Simulation] Optimization failed abruptly: {}",
-                  e.what());
+    spdlog::error("[Simulation] Optimization failed abruptly: {}", e.what());
   }
 
-  
   //----------------------------------------------------------------------------
   // Final Evaluation of 1-RDM and 2-RDM with optimal parameters
   //----------------------------------------------------------------------------
   spdlog::info("[Simulation] Evaluating final 1-RDM and 2-RDM...");
 
   std::vector<qcomp> final_1rdm_vals;
-  evaluate_functional(optimal_params, &data, qubits, final_1rdm_vals);
+  evaluate_functional(optimal_params, &ctx, ctx.qubits, final_1rdm_vals);
 
   nlohmann::json rdm_output;
   nlohmann::json rdm1_json = nlohmann::json::array();
 
-  for (size_t i = 0; i < data.rdm1_operators.size(); ++i) {
+  for (size_t i = 0; i < ctx.rdm1_operators.size(); ++i) {
     nlohmann::json term_json;
-    term_json["p"] = data.rdm1_operators[i].p;
-    term_json["q"] = data.rdm1_operators[i].q;
+    term_json["p"] = ctx.rdm1_operators[i].p;
+    term_json["q"] = ctx.rdm1_operators[i].q;
     term_json["val_real"] = final_1rdm_vals[i].real();
     term_json["val_imag"] = final_1rdm_vals[i].imag();
     rdm1_json.push_back(term_json);
@@ -789,7 +466,7 @@ double Simulation::run(
 #ifdef _WIN32
     command = "wsl ";
 #endif
-    command += "python3 python/generate_2rdm.py --n_qubits " + std::to_string(physics.get_num_qubits()) + " --mapping jordan_wigner";
+    command += "python3 python/generate_2rdm.py --n_qubits " + std::to_string(ctx.physics.get_num_qubits()) + " --mapping jordan_wigner";
     spdlog::info("[Simulation] Generating 2-RDM mapping: {}", command);
 
     FILE *pipe = _popen(command.c_str(), "r");
@@ -850,7 +527,7 @@ double Simulation::run(
       PauliStr p_arr[] = {rdm_term.strings[s]};
       PauliStrSum temp_sum = createPauliStrSum(p_arr, &one, 1);
       
-      double p_expect_real = calcExpecPauliStrSum(qubits, temp_sum);
+      double p_expect_real = calcExpecPauliStrSum(ctx.qubits, temp_sum);
       destroyPauliStrSum(temp_sum);
 
       term_expectation += rdm_term.coeffs[s] * p_expect_real;
@@ -866,18 +543,19 @@ double Simulation::run(
     rdm2_json.push_back(term_json);
   }
   rdm_output["2-RDM"] = rdm2_json;
+  
   // 1-RDM Spatiale
   nlohmann::json rdm1_spat_json = nlohmann::json::array();
-  int spat_n_orbs = data.num_qubits / 2;
+  int spat_n_orbs = ctx.num_qubits / 2;
   for (int p = 0; p < spat_n_orbs; ++p) {
     for (int q = 0; q < spat_n_orbs; ++q) {
       int spatial_idx = p * spat_n_orbs + q;
       nlohmann::json trm;
       trm["p"] = p;
       trm["q"] = q;
-      if (data.rdm1_spatial.size() > spatial_idx) {
-        trm["val_real"] = data.rdm1_spatial(spatial_idx).real();
-        trm["val_imag"] = data.rdm1_spatial(spatial_idx).imag();
+      if (ctx.rdm1_spatial.size() > spatial_idx) {
+        trm["val_real"] = ctx.rdm1_spatial(spatial_idx).real();
+        trm["val_imag"] = ctx.rdm1_spatial(spatial_idx).imag();
       } else {
         trm["val_real"] = 0.0;
         trm["val_imag"] = 0.0;
@@ -888,10 +566,10 @@ double Simulation::run(
   rdm_output["1-RDM_spatial"] = rdm1_spat_json;
 
   // Vector State direct from the QuEST simulation
-  long long dim = 1LL << data.num_qubits;
+  long long dim = 1LL << ctx.num_qubits;
   nlohmann::json state_json = nlohmann::json::array();
   for (long long k = 0; k < dim; ++k) {
-    qcomp amp = getQuregAmp(qubits, k);
+    qcomp amp = getQuregAmp(ctx.qubits, k);
     nlohmann::json amp_j;
     amp_j["real"] = amp.real();
     amp_j["imag"] = amp.imag();
@@ -900,31 +578,16 @@ double Simulation::run(
   rdm_output["state_vector"] = state_json;
 
   // Debug: final eta and structure factors
-  rdm_output["final_eta"] = data.last_eta;
+  rdm_output["final_eta"] = ctx.last_eta;
   {
     nlohmann::json cf_json = nlohmann::json::array();
-    for (int i = 0; i < data.last_calc_factors_abs.size(); ++i) {
-      cf_json.push_back(data.last_calc_factors_abs(i));
+    for (int i = 0; i < ctx.last_calc_factors_abs.size(); ++i) {
+      cf_json.push_back(ctx.last_calc_factors_abs(i));
     }
     rdm_output["final_calc_factors"] = cf_json;
   }
 
   final_rdms = rdm_output;
-
-
-  if (data.has_number_penalty) {
-    destroyPauliStrSum(data.number_penalty_op);
-  }
-
-  if (data.has_spin_penalty) {
-    destroyPauliStrSum(data.spin_penalty_op);
-  }
-
-  // Properly destruct pre-allocated single-term Pauli sums to prevent memory
-  // leaks
-  for (auto &sum : data.single_term_sums) {
-    destroyPauliStrSum(sum);
-  }
 
   return min_energy;
 }
@@ -951,17 +614,9 @@ void Simulation::set_tolerance(double tol) {
   spsa_optimizer.set_ftol_rel(tol);
 }
 
-/**
- * @brief Sets the number of shots for noisy simulation.
- * @param shots Number of measurement shots (0 for exact simulation).
- */
-void Simulation::set_shots(int shots) { n_shots = shots; }
 
-/**
- * @brief Sets the scaling factor for the diffraction penalty.
- * @param lambda Scaling factor value (default 1.0).
- */
-void Simulation::set_lambda(double lambda) { lambda_val = lambda; }
+
+
 
 /**
  * @brief Sets the optimizer type to use.
@@ -1006,43 +661,37 @@ double Simulation::get_last_std() const { return last_std; }
  */
 std::vector<double>
 Simulation::get_probabilities(const std::vector<double> &params) {
-  // Reset state and apply Hartree-Fock initialization
-  initZeroState(qubits);
-  int n_elec = physics.get_n_electrons();
-  for (int i = 0; i < n_elec; ++i) {
-    applyPauliX(qubits, i);
-  }
-
-  // Apply the Ansatz circuit
-  ansatz.construct_circuit(qubits, params, physics.get_pauli_strings());
-
-  // Calculate exact probabilities from state vector amplitudes
-  int num_qubits = physics.get_num_qubits();
+  int num_qubits = ctx.num_qubits;
   long long dim = 1LL << num_qubits;
   std::vector<double> probs(dim);
 
+  Qureg local_qubits = createQureg(num_qubits);
+  initZeroState(local_qubits);
+  ctx.ansatz.construct_circuit(local_qubits, params, ctx.paulis);
+
   for (long long i = 0; i < dim; ++i) {
-    qcomp amp = getQuregAmp(qubits, i);
+    qcomp amp = getQuregAmp(local_qubits, i);
     probs[i] = std::norm(std::complex<double>(amp.real(), amp.imag()));
   }
 
-  // Apply shot noise sampling if requested
-  if (n_shots > 0) {
+  if (ctx.n_shots > 0) {
     std::vector<double> sampled_probs(dim, 0.0);
     std::mt19937 gen(std::random_device{}());
     std::discrete_distribution<> d(probs.begin(), probs.end());
 
-    for (int k = 0; k < n_shots; ++k) {
+    for (int k = 0; k < ctx.n_shots; ++k) {
       int outcome = d(gen);
       sampled_probs[outcome] += 1.0;
     }
 
     for (auto &p : sampled_probs) {
-      p /= n_shots;
+      p /= ctx.n_shots;
     }
+    destroyQureg(local_qubits);
     return sampled_probs;
   }
 
+  destroyQureg(local_qubits);
   return probs;
 }
 

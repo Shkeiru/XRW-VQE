@@ -140,6 +140,7 @@ FetchContent_MakeAvailable(nlohmann_json)
 # C'est ta lib physique. Elle ne connait PAS le GUI.
 add_library(core STATIC
     src/core/simulation.cpp
+    src/core/vqe_context.cpp
     src/core/ansatz.cpp
     src/core/physics.cpp
     src/core/opt.cpp

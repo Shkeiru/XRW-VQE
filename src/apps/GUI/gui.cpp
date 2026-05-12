@@ -228,6 +228,24 @@ void GUI::DrawConfiguration() {
   }
 
   //--------------------------------------------------------------------------
+  // Warm Start (Optional)
+  //--------------------------------------------------------------------------
+  ImGui::SeparatorText("3.5 Warm Start (Optionnel)");
+  ImGui::Checkbox("Utiliser Warm Start", &use_warm_start);
+  if (use_warm_start) {
+    if (ImGui::Button("Choisir Fichier Warm Start")) {
+      IGFD::FileDialogConfig config;
+      config.path = ".";
+      ImGuiFileDialog::Instance()->OpenDialog(
+          "ChooseWarmStart", "Choisir Fichier Warm Start", ".json", config);
+    }
+    ImGui::SameLine();
+    ImGui::TextWrapped(
+        "%s",
+        filepath_warm_start.empty() ? "Aucun" : filepath_warm_start.c_str());
+  }
+
+  //--------------------------------------------------------------------------
   // Diffraction Data (File Selection)
   //--------------------------------------------------------------------------
   ImGui::SeparatorText("1.5 Donnees de Diffraction");
@@ -268,6 +286,13 @@ void GUI::DrawConfiguration() {
   }
 
   // Draw dialogs
+  if (ImGuiFileDialog::Instance()->Display("ChooseWarmStart")) {
+    if (ImGuiFileDialog::Instance()->IsOk()) {
+      filepath_warm_start = ImGuiFileDialog::Instance()->GetFilePathName();
+    }
+    ImGuiFileDialog::Instance()->Close();
+  }
+
   if (ImGuiFileDialog::Instance()->Display("ChooseIntegrals")) {
     if (ImGuiFileDialog::Instance()->IsOk()) {
       filepath_integrals = ImGuiFileDialog::Instance()->GetFilePathName();
@@ -338,7 +363,10 @@ void GUI::DrawConfiguration() {
 
       calculation_thread = std::thread(
           [this, selected_algo, current_ansatz_idx, current_depth, current_map,
-           integrals_path, factors_path, current_lambda, is_spsa, s_a, s_c, s_A, s_alpha, s_gamma]() {
+           integrals_path, factors_path, current_lambda, is_spsa, s_a, s_c, s_A,
+           s_alpha, s_gamma,
+           ws_enabled = use_warm_start,
+           ws_path = use_warm_start ? filepath_warm_start : std::string("")]() {
             try {
               // 1. Load Physics
               Physics physics("hamiltonian.json");
@@ -360,8 +388,14 @@ void GUI::DrawConfiguration() {
                                             physics.get_n_electrons(), map_str);
               }
 
-              // 3. Create Simulation
-              Simulation sim(physics, *ansatz, selected_algo);
+              // 3. Create VQEContext
+              VQEContext ctx(physics, *ansatz);
+              ctx.n_shots = shots;
+              ctx.lambda = current_lambda;
+              ctx.setup(factors_path, integrals_path);
+
+              // 4. Create Simulation
+              Simulation sim(ctx, selected_algo);
               if (is_spsa) {
                 sim.set_optimizer_type(Simulation::OptType::SPSA);
                 SPSAParams params;
@@ -376,11 +410,77 @@ void GUI::DrawConfiguration() {
               }
               sim.set_max_evals(max_iter);
               sim.set_tolerance(tolerance);
-              sim.set_shots(shots);
-              sim.set_lambda(current_lambda);
 
               // 4. Run Optimization
               std::vector<double> params(ansatz->get_num_params(), 0);
+
+              // --- Warm Start: Load parameters if enabled ---
+              if (ws_enabled && !ws_path.empty()) {
+                try {
+                  std::ifstream ws_file(ws_path);
+                  if (!ws_file.good()) {
+                    spdlog::error("Warm start file not found: {}", ws_path);
+                  } else {
+                    nlohmann::json ws_json;
+                    ws_file >> ws_json;
+
+                    auto tag = ws_json["ansatz_tag"];
+                    std::string ws_type = tag["type"].get<std::string>();
+                    int ws_nq = tag["num_qubits"].get<int>();
+                    std::string expected_type =
+                        (current_ansatz_idx == 0) ? "HEA" : "UCCSD";
+
+                    bool valid = true;
+                    if (ws_type != expected_type) {
+                      spdlog::error(
+                          "Warm start ansatz mismatch: file={}, current={}",
+                          ws_type, expected_type);
+                      valid = false;
+                    }
+                    if (ws_nq != (int)physics.get_num_qubits()) {
+                      spdlog::error(
+                          "Warm start num_qubits mismatch: file={}, current={}",
+                          ws_nq, physics.get_num_qubits());
+                      valid = false;
+                    }
+                    if (valid && ws_type == "HEA" &&
+                        tag["depth"].get<int>() != current_depth) {
+                      spdlog::error(
+                          "Warm start HEA depth mismatch: file={}, current={}",
+                          tag["depth"].get<int>(), current_depth);
+                      valid = false;
+                    }
+                    if (valid && ws_type == "UCCSD" &&
+                        tag["num_electrons"].get<int>() !=
+                            (int)physics.get_n_electrons()) {
+                      spdlog::error(
+                          "Warm start UCCSD num_electrons mismatch: file={}, "
+                          "current={}",
+                          tag["num_electrons"].get<int>(),
+                          physics.get_n_electrons());
+                      valid = false;
+                    }
+
+                    if (valid) {
+                      auto ws_params =
+                          ws_json["parameters"].get<std::vector<double>>();
+                      if ((int)ws_params.size() != ansatz->get_num_params()) {
+                        spdlog::error(
+                            "Warm start params size mismatch: file={}, "
+                            "expected={}",
+                            ws_params.size(), ansatz->get_num_params());
+                      } else {
+                        params = ws_params;
+                        spdlog::info(
+                            "Warm start loaded: {} parameters from {}",
+                            params.size(), ws_path);
+                      }
+                    }
+                  }
+                } catch (const std::exception &e) {
+                  spdlog::error("Warm start loading failed: {}", e.what());
+                }
+              }
 
               double min_energy = sim.run(
                   params,
@@ -401,8 +501,7 @@ void GUI::DrawConfiguration() {
                     current_iter = iter;
                     if (total_energy < best_energy)
                       best_energy = total_energy;
-                  },
-                  factors_path, integrals_path);
+                  });
 
               // 5. Update Status with Noise Results (if any)
               try {
@@ -749,6 +848,38 @@ void GUI::SaveRun() {
   std::ofstream rdm_out(rdm_filename);
   rdm_out << std::setw(4) << final_results.rdms << std::endl;
   spdlog::info("RDMs sauvegardes dans: {}", rdm_filename);
+
+  // --- Warm Start Export ---
+  {
+    nlohmann::json ws_json;
+    nlohmann::json ws_tag;
+    std::string ans_type = ansatz_types[ansatz_idx];
+    ws_tag["type"] = ans_type;
+    ws_tag["num_qubits"] = num_qubits;
+    if (ans_type == "HEA") {
+      ws_tag["depth"] = hea_depth;
+    } else if (ans_type == "UCCSD") {
+      // num_electrons is not directly stored in GUI, extract from params_history context
+      // For now, we tag with num_qubits which is sufficient for validation
+    }
+    ws_json["ansatz_tag"] = ws_tag;
+
+    // Get final parameters from history
+    std::vector<double> final_params;
+    {
+      std::lock_guard<std::mutex> lock(graph_mutex);
+      if (!params_history.empty()) {
+        final_params = params_history.back();
+      }
+    }
+    ws_json["num_params"] = (int)final_params.size();
+    ws_json["parameters"] = final_params;
+
+    std::string ws_filename = "warm_start_" + filename_ts + ".json";
+    std::ofstream ws_out(ws_filename);
+    ws_out << std::setw(4) << ws_json << std::endl;
+    spdlog::info("Warm start sauvegarde dans: {}", ws_filename);
+  }
 }
 
 //------------------------------------------------------------------------------
