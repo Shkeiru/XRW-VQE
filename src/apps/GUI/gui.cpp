@@ -15,6 +15,7 @@
 #include "gui.hpp"
 #include "../core/logger.hpp"
 #include "../core/simulation.hpp"
+#include "../core/adapt_sim.hpp"
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -22,6 +23,7 @@
 #include <iostream>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <random>
 
 //------------------------------------------------------------------------------
 //     CONSTRUCTOR / DESTRUCTOR
@@ -206,6 +208,14 @@ void GUI::DrawConfiguration() {
     shots = 0;
 
   ImGui::Spacing();
+  ImGui::SeparatorText("2.5 ADAPT-VQE");
+  ImGui::Checkbox("Enable ADAPT-VQE", &use_adapt);
+  if (use_adapt) {
+    ImGui::Text("ADAPT Gradient L2 Tolerance:");
+    ImGui::InputDouble("##adapt_tol", &adapt_epsilon, 0.0, 0.0, "%.1e");
+  }
+
+  ImGui::Spacing();
 
   //--------------------------------------------------------------------------
   // Ansatz Configuration
@@ -334,6 +344,8 @@ void GUI::DrawConfiguration() {
       current_chi_squared = 0.0;
       best_energy = 1e9;
       counts_values.clear();
+      macro_boundaries.clear();
+      macro_colors.clear();
 
       // Pre-reserve history vectors to avoid repeated allocations
       iter_history.reserve(max_iter);
@@ -349,7 +361,8 @@ void GUI::DrawConfiguration() {
         calculation_thread.join();
 
       nlopt::algorithm selected_algo = optimizer_enums[optimizer_idx];
-      bool is_spsa = (std::string(optimizers[optimizer_idx]) == "SPSA");
+      std::string current_optimizer_name = optimizers[optimizer_idx];
+      bool is_spsa = (current_optimizer_name == "SPSA");
       double s_a = spsa_a, s_c = spsa_c, s_A = spsa_A, s_alpha = spsa_alpha, s_gamma = spsa_gamma;
 
       // Capture necessary values by value for thread safety
@@ -362,7 +375,7 @@ void GUI::DrawConfiguration() {
       double current_lambda = lambda_diffraction;
 
       calculation_thread = std::thread(
-          [this, selected_algo, current_ansatz_idx, current_depth, current_map,
+          [this, selected_algo, current_optimizer_name, current_ansatz_idx, current_depth, current_map,
            integrals_path, factors_path, current_lambda, is_spsa, s_a, s_c, s_A,
            s_alpha, s_gamma,
            ws_enabled = use_warm_start,
@@ -388,143 +401,193 @@ void GUI::DrawConfiguration() {
                                             physics.get_n_electrons(), map_str);
               }
 
-              // 3. Create VQEContext
-              VQEContext ctx(physics, *ansatz);
-              ctx.n_shots = shots;
-              ctx.lambda = current_lambda;
-              ctx.setup(factors_path, integrals_path);
+              // 4. Create VQEContext
+              // If ADAPT, we defer to ADAPT_sim.
+              std::unique_ptr<VQEContext> ctx;
+              std::unique_ptr<Simulation> sim;
 
-              // 4. Create Simulation
-              Simulation sim(ctx, selected_algo);
-              if (is_spsa) {
-                sim.set_optimizer_type(Simulation::OptType::SPSA);
-                SPSAParams params;
-                params.a = s_a;
-                params.c = s_c;
-                params.A = s_A;
-                params.alpha = s_alpha;
-                params.gamma = s_gamma;
-                sim.set_spsa_params(params);
+              if (use_adapt) {
+                spdlog::info(">>> Starting ADAPT-VQE Mode...");
+                ADAPT_sim adapt_sim(physics,
+                                    current_optimizer_name, max_iter, tolerance, adapt_epsilon,
+                                    shots, current_lambda, factors_path, integrals_path,
+                                    "adapt_gui_out.json", 10,
+                                    [this](int iter, double total_energy, double quantum_energy,
+                                           double chi_squared, const std::vector<double> &probs,
+                                           const std::vector<double> &cb_params) {
+                                      std::lock_guard<std::mutex> lock(graph_mutex);
+                                      if (iter == 1 || iter_history.empty()) {
+                                        macro_boundaries.push_back(iter_history.size());
+                                        // Generate random color for this macro iteration
+                                        float r = 0.3f + (float)rand() / (float)RAND_MAX * 0.7f;
+                                        float g = 0.3f + (float)rand() / (float)RAND_MAX * 0.7f;
+                                        float b = 0.3f + (float)rand() / (float)RAND_MAX * 0.7f;
+                                        macro_colors.push_back(ImVec4(r, g, b, 1.0f));
+                                      }
+                                      iter_history.push_back((double)(iter_history.size() + 1));
+                                      energy_history.push_back(total_energy);
+                                      base_energy_history.push_back(quantum_energy);
+                                      chi_squared_history.push_back(chi_squared);
+                                      probs_history.push_back(probs);
+                                      params_history.push_back(cb_params);
+                                      current_energy = total_energy;
+                                      current_base_energy = quantum_energy;
+                                      current_chi_squared = chi_squared;
+                                      counts_values = probs;
+                                      current_iter = iter;
+                                      if (total_energy < best_energy)
+                                        best_energy = total_energy;
+                                    });
+                adapt_sim.run_adapt();
+
+                std::lock_guard<std::mutex> lock(graph_mutex);
+                is_running = false;
+                status_message = "ADAPT-VQE Termine.";
               } else {
-                sim.set_optimizer_type(Simulation::OptType::NLOPT);
-              }
-              sim.set_max_evals(max_iter);
-              sim.set_tolerance(tolerance);
+                ctx = std::make_unique<VQEContext>(physics, *ansatz);
+                ctx->n_shots = shots;
+                ctx->lambda = current_lambda;
+                ctx->setup(factors_path, integrals_path);
 
-              // 4. Run Optimization
-              std::vector<double> params(ansatz->get_num_params(), 0);
+                sim = std::make_unique<Simulation>(*ctx, selected_algo);
+                if (is_spsa) {
+                  sim->set_optimizer_type(Simulation::OptType::SPSA);
+                  SPSAParams params_spsa;
+                  params_spsa.a = s_a;
+                  params_spsa.c = s_c;
+                  params_spsa.A = s_A;
+                  params_spsa.alpha = s_alpha;
+                  params_spsa.gamma = s_gamma;
+                  sim->set_spsa_params(params_spsa);
+                } else {
+                  sim->set_optimizer_type(Simulation::OptType::NLOPT);
+                }
+                sim->set_max_evals(max_iter);
+                sim->set_tolerance(tolerance);
 
-              // --- Warm Start: Load parameters if enabled ---
-              if (ws_enabled && !ws_path.empty()) {
-                try {
-                  std::ifstream ws_file(ws_path);
-                  if (!ws_file.good()) {
-                    spdlog::error("Warm start file not found: {}", ws_path);
-                  } else {
-                    nlohmann::json ws_json;
-                    ws_file >> ws_json;
+                // 4. Run Optimization
+                std::vector<double> params(ansatz->get_num_params(), 0);
 
-                    auto tag = ws_json["ansatz_tag"];
-                    std::string ws_type = tag["type"].get<std::string>();
-                    int ws_nq = tag["num_qubits"].get<int>();
-                    std::string expected_type =
-                        (current_ansatz_idx == 0) ? "HEA" : "UCCSD";
+                // Small random perturbation to break zero-initialization symmetry
+                {
+                  std::mt19937 rng(std::random_device{}());
+                  std::uniform_real_distribution<double> dist(-1e-3, 1e-3);
+                  for (auto& p : params) p = dist(rng);
+                  spdlog::info("Initial parameters perturbed with uniform noise in [-0.001, 0.001] rad");
+                }
 
-                    bool valid = true;
-                    if (ws_type != expected_type) {
-                      spdlog::error(
-                          "Warm start ansatz mismatch: file={}, current={}",
-                          ws_type, expected_type);
-                      valid = false;
-                    }
-                    if (ws_nq != (int)physics.get_num_qubits()) {
-                      spdlog::error(
-                          "Warm start num_qubits mismatch: file={}, current={}",
-                          ws_nq, physics.get_num_qubits());
-                      valid = false;
-                    }
-                    if (valid && ws_type == "HEA" &&
-                        tag["depth"].get<int>() != current_depth) {
-                      spdlog::error(
-                          "Warm start HEA depth mismatch: file={}, current={}",
-                          tag["depth"].get<int>(), current_depth);
-                      valid = false;
-                    }
-                    if (valid && ws_type == "UCCSD" &&
-                        tag["num_electrons"].get<int>() !=
-                            (int)physics.get_n_electrons()) {
-                      spdlog::error(
-                          "Warm start UCCSD num_electrons mismatch: file={}, "
-                          "current={}",
-                          tag["num_electrons"].get<int>(),
-                          physics.get_n_electrons());
-                      valid = false;
-                    }
+                // --- Warm Start: Load parameters if enabled ---
+                if (ws_enabled && !ws_path.empty()) {
+                  try {
+                    std::ifstream ws_file(ws_path);
+                    if (!ws_file.good()) {
+                      spdlog::error("Warm start file not found: {}", ws_path);
+                    } else {
+                      nlohmann::json ws_json;
+                      ws_file >> ws_json;
 
-                    if (valid) {
-                      auto ws_params =
-                          ws_json["parameters"].get<std::vector<double>>();
-                      if ((int)ws_params.size() != ansatz->get_num_params()) {
+                      auto tag = ws_json["ansatz_tag"];
+                      std::string ws_type = tag["type"].get<std::string>();
+                      int ws_nq = tag["num_qubits"].get<int>();
+                      std::string expected_type =
+                          (current_ansatz_idx == 0) ? "HEA" : "UCCSD";
+
+                      bool valid = true;
+                      if (ws_type != expected_type) {
                         spdlog::error(
-                            "Warm start params size mismatch: file={}, "
-                            "expected={}",
-                            ws_params.size(), ansatz->get_num_params());
-                      } else {
-                        params = ws_params;
-                        spdlog::info(
-                            "Warm start loaded: {} parameters from {}",
-                            params.size(), ws_path);
+                            "Warm start ansatz mismatch: file={}, current={}",
+                            ws_type, expected_type);
+                        valid = false;
+                      }
+                      if (ws_nq != (int)physics.get_num_qubits()) {
+                        spdlog::error(
+                            "Warm start num_qubits mismatch: file={}, current={}",
+                            ws_nq, physics.get_num_qubits());
+                        valid = false;
+                      }
+                      if (valid && ws_type == "HEA" &&
+                          tag["depth"].get<int>() != current_depth) {
+                        spdlog::error(
+                            "Warm start HEA depth mismatch: file={}, current={}",
+                            tag["depth"].get<int>(), current_depth);
+                        valid = false;
+                      }
+                      if (valid && ws_type == "UCCSD" &&
+                          tag["num_electrons"].get<int>() !=
+                              (int)physics.get_n_electrons()) {
+                        spdlog::error(
+                            "Warm start UCCSD num_electrons mismatch: file={}, "
+                            "current={}",
+                            tag["num_electrons"].get<int>(),
+                            physics.get_n_electrons());
+                        valid = false;
+                      }
+
+                      if (valid) {
+                        auto ws_params =
+                            ws_json["parameters"].get<std::vector<double>>();
+                        if ((int)ws_params.size() != ansatz->get_num_params()) {
+                          spdlog::error(
+                              "Warm start params size mismatch: file={}, "
+                              "expected={}",
+                              ws_params.size(), ansatz->get_num_params());
+                        } else {
+                          params = ws_params;
+                          spdlog::info(
+                              "Warm start loaded: {} parameters from {}",
+                              params.size(), ws_path);
+                        }
                       }
                     }
+                  } catch (const std::exception &e) {
+                    spdlog::error("Warm start loading failed: {}", e.what());
                   }
-                } catch (const std::exception &e) {
-                  spdlog::error("Warm start loading failed: {}", e.what());
                 }
-              }
 
-              double min_energy = sim.run(
-                  params,
-                  [this](int iter, double total_energy, double quantum_energy,
-                         double chi_squared, const std::vector<double> &probs,
-                         const std::vector<double> &cb_params) {
-                    std::lock_guard<std::mutex> lock(graph_mutex);
-                    iter_history.push_back((double)iter);
-                    energy_history.push_back(total_energy);
-                    base_energy_history.push_back(quantum_energy);
-                    chi_squared_history.push_back(chi_squared);
-                    probs_history.push_back(probs);
-                    params_history.push_back(cb_params);
-                    current_energy = total_energy;
-                    current_base_energy = quantum_energy;
-                    current_chi_squared = chi_squared;
-                    counts_values = probs;
-                    current_iter = iter;
-                    if (total_energy < best_energy)
-                      best_energy = total_energy;
-                  });
+                double min_energy = sim->run(
+                    params,
+                    [this](int iter, double total_energy, double quantum_energy,
+                           double chi_squared, const std::vector<double> &probs,
+                           const std::vector<double> &cb_params) {
+                      std::lock_guard<std::mutex> lock(graph_mutex);
+                      iter_history.push_back((double)iter);
+                      energy_history.push_back(total_energy);
+                      base_energy_history.push_back(quantum_energy);
+                      chi_squared_history.push_back(chi_squared);
+                      probs_history.push_back(probs);
+                      params_history.push_back(cb_params);
+                      current_energy = total_energy;
+                      current_base_energy = quantum_energy;
+                      current_chi_squared = chi_squared;
+                      counts_values = probs;
+                      current_iter = iter;
+                      if (total_energy < best_energy)
+                        best_energy = total_energy;
+                    });
 
-              // 5. Update Status with Noise Results (if any)
-              try {
-                std::lock_guard<std::mutex> lock(graph_mutex);
-                is_running = false;
-                status_message = "VQE Termine.";
+                // 5. Update Status with Noise Results (if any)
+                try {
+                  std::lock_guard<std::mutex> lock(graph_mutex);
+                  is_running = false;
+                  status_message = "VQE Termine.";
 
-                // If shots > 0, min_energy IS the noisy energy from the last
-                // step
-                final_results.noisy_energy = min_energy;
-                final_results.variance = sim.get_last_variance();
-                final_results.noise_std = sim.get_last_std();
+                  // If shots > 0, min_energy IS the noisy energy from the last
+                  // step
+                  final_results.noisy_energy = min_energy;
+                  final_results.variance = sim->get_last_variance();
+                  final_results.noise_std = sim->get_last_std();
 
-                // Get probabilities for final params
-                final_results.sampled_probs = sim.get_probabilities(params);
-                
-                // Get evaluated RDMs
-                final_results.rdms = sim.get_rdms();
-              } catch (const std::exception &e) {
-                std::lock_guard<std::mutex> lock(graph_mutex);
-                is_running = false;
-                status_message = "Erreur VQE.";
-                spdlog::error("Erreur VQE Probabilites: {}", e.what());
+                  // Get probabilities for final params
+                  final_results.sampled_probs = sim->get_probabilities(params);
+                  
+                  // Get evaluated RDMs
+                  final_results.rdms = sim->get_rdms();
+                } catch (const std::exception &e) {
+                  std::lock_guard<std::mutex> lock(graph_mutex);
+                  is_running = false;
+                  status_message = "Erreur VQE.";
+                  spdlog::error("Erreur VQE Probabilites: {}", e.what());
+                }
               }
             } catch (const std::exception &e) {
               std::lock_guard<std::mutex> lock(graph_mutex);
@@ -645,13 +708,23 @@ void GUI::DrawPlots() {
 
     std::lock_guard<std::mutex> lock(graph_mutex);
     if (!iter_history.empty()) {
-      ImPlot::PlotLine(
-          "Energie", iter_history.data(), energy_history.data(),
-          iter_history.size(),
-          ImPlotSpec(ImPlotProp_Marker, ImPlotMarker_Diamond,
-                     ImPlotProp_MarkerSize, 4.0f, ImPlotProp_MarkerFillColor,
-                     ImVec4(1, 1, 0, 1), ImPlotProp_MarkerLineColor,
-                     ImVec4(1, 1, 0, 1)));
+      if (macro_boundaries.empty()) {
+        // Standard VQE or fallback: plot single line
+        ImPlot::PlotLine(
+            "Energie", iter_history.data(), energy_history.data(),
+            iter_history.size());
+      } else {
+        // ADAPT-VQE: plot segmented lines with different colors
+        for (size_t i = 0; i < macro_boundaries.size(); ++i) {
+          int start_idx = macro_boundaries[i];
+          int end_idx = (i + 1 < macro_boundaries.size()) ? macro_boundaries[i + 1] : iter_history.size();
+          int count = end_idx - start_idx;
+          if (count > 0) {
+            std::string label = "Macro Iter " + std::to_string(i + 1);
+            ImPlot::PlotLine(label.c_str(), &iter_history[start_idx], &energy_history[start_idx], count, ImPlotSpec(ImPlotProp_LineColor, macro_colors[i]));
+          }
+        }
+      }
     }
     ImPlot::EndPlot();
   }

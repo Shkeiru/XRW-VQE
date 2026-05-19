@@ -298,12 +298,41 @@ double Simulation::cost_function(const std::vector<double> &params,
   double base_energy = evaluate_functional(params, data, data->qubits, data->current_1rdm, &current_quantum_energy, &current_chi_squared);
 
   // 2. Calculate the local gradients using Parameter Shift Rule (PSR)
-  // ONLY if requested by the optimizer
+  // Supports both standard PSR (M=1) and generalized PSR (M>1) for shared params
   if (!grad.empty()) {
     int num_params = params.size();
 
+    // Query gate multiplicities once
+    std::vector<int> multiplicities = data->ansatz.get_gate_multiplicities();
+
+    // One-time warning if shared parameters detected
+    static bool warned_shared = false;
+    if (!warned_shared) {
+      for (int m : multiplicities) {
+        if (m > 1) {
+          spdlog::warn("[Simulation] Shared parameters detected (M > 1). "
+                       "Using Generalized PSR for gradient computation "
+                       "(2M evals/param instead of 2).");
+          warned_shared = true;
+          break;
+        }
+      }
+    }
+
     // Initialize Qureg
     Qureg local_qubits = createQureg(data->num_qubits);
+
+    // Helper lambda for shifted circuit evaluation (generalized PSR path)
+    auto eval_shifted = [&](const std::vector<double>& p, int param_idx,
+                            int gate_idx, double shift) -> double {
+      initZeroState(local_qubits);
+      for (int e = 0; e < data->n_electrons; ++e) {
+        applyPauliX(local_qubits, e);
+      }
+      data->ansatz.construct_circuit_with_shift(
+          local_qubits, p, data->paulis, param_idx, gate_idx, shift);
+      return calcExpecPauliStrSum(local_qubits, data->hamiltonian);
+    };
 
     // Evaluate parameter shifts sequentially to allow QuEST/Eigen to fully
     // utilize threads
@@ -313,22 +342,35 @@ double Simulation::cost_function(const std::vector<double> &params,
         continue;
 
       try {
-        std::vector<double> shifted_params = params;
-        std::vector<qcomp> rdm1_plus;
-        std::vector<qcomp> rdm1_minus;
+        int M = multiplicities[i];
 
-        // Shift +π/2
-        shifted_params[i] = params[i] + M_PI / 2.0;
-        double e_plus =
-            evaluate_functional(shifted_params, data, local_qubits, rdm1_plus);
+        if (M == 1) {
+          // ── FAST PATH: standard PSR (unchanged, zero overhead) ──
+          std::vector<double> shifted_params = params;
+          std::vector<qcomp> rdm1_plus;
+          std::vector<qcomp> rdm1_minus;
 
-        // Shift -π/2
-        shifted_params[i] = params[i] - M_PI / 2.0;
-        double e_minus =
-            evaluate_functional(shifted_params, data, local_qubits, rdm1_minus);
+          // Shift +π/2
+          shifted_params[i] = params[i] + M_PI / 2.0;
+          double e_plus =
+              evaluate_functional(shifted_params, data, local_qubits, rdm1_plus);
 
-        // Parameter Shift Rule formula
-        grad[i] = 0.5 * (e_plus - e_minus);
+          // Shift -π/2
+          shifted_params[i] = params[i] - M_PI / 2.0;
+          double e_minus =
+              evaluate_functional(shifted_params, data, local_qubits, rdm1_minus);
+
+          // Parameter Shift Rule formula
+          grad[i] = 0.5 * (e_plus - e_minus);
+        } else {
+          // ── GENERALIZED PSR: sum over per-gate contributions ──
+          grad[i] = 0.0;
+          for (int gate_idx = 0; gate_idx < M; ++gate_idx) {
+            double e_plus = eval_shifted(params, i, gate_idx, M_PI / 2.0);
+            double e_minus = eval_shifted(params, i, gate_idx, -M_PI / 2.0);
+            grad[i] += 0.5 * (e_plus - e_minus);
+          }
+        }
 
         // Reset the Qureg
         initZeroState(local_qubits);
@@ -409,7 +451,9 @@ double Simulation::run(
 
   // Initialize VQE data context for the cost function
   spdlog::info("[Simulation] Starting VQE Optimization with {} params and max {} evaluations",
-               ctx.ansatz.get_num_params(), optimizer.get_maxeval());
+               ctx.ansatz.get_num_params(),
+               (opt_type_ == OptType::NLOPT) ? optimizer.get_maxeval()
+                                             : spsa_optimizer.get_maxeval());
 
   ctx.callback = callback;
   ctx.current_iter = 0;
@@ -430,7 +474,20 @@ double Simulation::run(
     if (opt_type_ == OptType::NLOPT) {
       result = optimizer.optimize(optimal_params, min_energy);
     } else {
+      // Setup: give SPSA direct access to evaluate_functional for its
+      // internal perturbation evaluations (f_plus, f_minus) without
+      // triggering the cost_function callback.
+      Qureg local_qubits = createQureg(ctx.num_qubits);
+
+      spsa_optimizer.set_eval_function(
+          [&](const std::vector<double> &params) -> double {
+            std::vector<qcomp> rdm1_tmp;
+            return evaluate_functional(params, &ctx, local_qubits, rdm1_tmp);
+          });
+
       result = spsa_optimizer.optimize(optimal_params, min_energy);
+
+      destroyQureg(local_qubits);
     }
     spdlog::info("[Simulation] Optimization finished successfully - Result code: {}, Min Energy: {:.6f}",
                  (int)result, min_energy);

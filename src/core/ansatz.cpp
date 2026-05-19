@@ -134,7 +134,7 @@ UCCSD::UCCSD(int num_qubits, int num_electrons, std::string mapping)
 #ifdef _WIN32
   cmd = "wsl ";
 #endif
-  cmd += "python3 ./python/generate_uccsd.py --n_qubits " +
+  cmd += "python3 python/generate_uccsd.py --n_qubits " +
          std::to_string(num_qubits) + " --n_electrons " +
          std::to_string(num_electrons) + " --mapping " + mapping +
          " --output uccsd.json";
@@ -202,6 +202,13 @@ UCCSD::UCCSD(int num_qubits, int num_electrons, std::string mapping)
     }
 
     spdlog::info("[UCCSD] Tape optimization complete. Final size: {} gadgets.", optimized_tape.size());
+
+    // Pre-compute gate counts per parameter for generalized PSR
+    gate_counts.assign(excitations.size(), 0);
+    for (const auto &inst : optimized_tape) {
+      gate_counts[inst.param_idx]++;
+    }
+
     spdlog::trace("[UCCSD] Number of parameters generated: {}", get_num_params());
 
   } catch (const std::exception &e) {
@@ -238,5 +245,148 @@ void UCCSD::construct_circuit(Qureg qubits, const std::vector<double> &params,
     
     // BAM ! Une seule instruction C++.
     applyPauliGadget(qubits, str, angle);
+  }
+}
+
+std::vector<int> UCCSD::get_gate_multiplicities() const {
+  return gate_counts;
+}
+
+void UCCSD::construct_circuit_with_shift(
+    Qureg qubits, const std::vector<double> &params,
+    const std::vector<std::string> &pauli_strings,
+    int shifted_param_idx, int shifted_gate_idx, double shift_value) {
+
+  if (params.size() != get_num_params()) {
+    spdlog::error("[UCCSD] Error: param size mismatch in shifted circuit. Attendu: {}, Reçu: {}",
+                  get_num_params(), params.size());
+    return;
+  }
+
+  int gate_counter = 0; // counts gates belonging to shifted_param_idx
+  for (const auto &inst : optimized_tape) {
+    PauliStr str = getPauliStr(inst.pauli_chars.c_str(), const_cast<int*>(inst.targets.data()), inst.targets.size());
+
+    double angle;
+    if (inst.param_idx == shifted_param_idx) {
+      if (gate_counter == shifted_gate_idx) {
+        angle = (params[inst.param_idx] + shift_value) * inst.multiplier;
+      } else {
+        angle = params[inst.param_idx] * inst.multiplier;
+      }
+      gate_counter++;
+    } else {
+      angle = params[inst.param_idx] * inst.multiplier;
+    }
+
+    applyPauliGadget(qubits, str, angle);
+  }
+}
+
+//------------------------------------------------------------------------------
+//     ADAPT ANSATZ
+//------------------------------------------------------------------------------
+
+ADAPTAnsatz::~ADAPTAnsatz() {}
+
+ADAPTAnsatz::ADAPTAnsatz(int num_qubits, int num_electrons) : num_qubits(num_qubits), num_electrons(num_electrons) {}
+
+void ADAPTAnsatz::add_operator(const std::vector<GadgetInst> &op) {
+  int current_param_idx = operators_tape.size(); // The new parameter index is the current size
+  std::vector<GadgetInst> op_copy = op;
+  
+  // Re-link the parameter index for all gadgets in this operator
+  for (auto &gadget : op_copy) {
+    gadget.param_idx = current_param_idx;
+  }
+  
+  operators_tape.push_back(op_copy);
+}
+
+void ADAPTAnsatz::remove_last_operator() {
+  if (!operators_tape.empty()) {
+    operators_tape.pop_back();
+  }
+}
+
+int ADAPTAnsatz::get_num_params() const { 
+  return operators_tape.size(); 
+}
+
+int ADAPTAnsatz::get_num_qubits() const { 
+  return num_qubits; 
+}
+
+std::string ADAPTAnsatz::get_name() const {
+  return "ADAPTAnsatz (" + std::to_string(operators_tape.size()) + " operators)";
+}
+
+bool ADAPTAnsatz::preserves_particle_number() const { 
+  // ADAPT usually constructs an ansatz out of preserving operators, 
+  // but just to be safe with any pool, we return false to enforce particle number penalties.
+  return false; 
+}
+
+bool ADAPTAnsatz::preserves_spin() const { 
+  return false; 
+}
+
+void ADAPTAnsatz::construct_circuit(Qureg qubits, const std::vector<double> &params,
+                                    const std::vector<std::string> &pauli_strings) {
+  if (params.size() != get_num_params()) {
+    spdlog::error("[ADAPTAnsatz] Error: param size mismatch. Attendu: {}, Reçu: {}",
+                  get_num_params(), params.size());
+    return;
+  }
+
+  // Déroulage avec les Pauli Gadgets de QuEST
+  for (const auto &op : operators_tape) {
+    for (const auto &inst : op) {
+      // Création de la chaîne PauliStr
+      PauliStr str = getPauliStr(inst.pauli_chars.c_str(), const_cast<int*>(inst.targets.data()), inst.targets.size());
+      
+      // Calcul de l'angle
+      double angle = params[inst.param_idx] * inst.multiplier;
+      
+      applyPauliGadget(qubits, str, angle);
+    }
+  }
+}
+
+std::vector<int> ADAPTAnsatz::get_gate_multiplicities() const {
+  std::vector<int> mults;
+  mults.reserve(operators_tape.size());
+  for (const auto &op : operators_tape) {
+    mults.push_back(static_cast<int>(op.size()));
+  }
+  return mults;
+}
+
+void ADAPTAnsatz::construct_circuit_with_shift(
+    Qureg qubits, const std::vector<double> &params,
+    const std::vector<std::string> &pauli_strings,
+    int shifted_param_idx, int shifted_gate_idx, double shift_value) {
+
+  if (params.size() != get_num_params()) {
+    spdlog::error("[ADAPTAnsatz] Error: param size mismatch in shifted circuit. Attendu: {}, Reçu: {}",
+                  get_num_params(), params.size());
+    return;
+  }
+
+  for (size_t op_idx = 0; op_idx < operators_tape.size(); ++op_idx) {
+    const auto &op = operators_tape[op_idx];
+    for (size_t g = 0; g < op.size(); ++g) {
+      const auto &inst = op[g];
+      PauliStr str = getPauliStr(inst.pauli_chars.c_str(), const_cast<int*>(inst.targets.data()), inst.targets.size());
+
+      double angle;
+      if ((int)op_idx == shifted_param_idx && (int)g == shifted_gate_idx) {
+        angle = (params[inst.param_idx] + shift_value) * inst.multiplier;
+      } else {
+        angle = params[inst.param_idx] * inst.multiplier;
+      }
+
+      applyPauliGadget(qubits, str, angle);
+    }
   }
 }

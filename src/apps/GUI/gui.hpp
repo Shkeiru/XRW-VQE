@@ -183,6 +183,8 @@ private:
   //----------------------------------------------------------------------------
 
   std::vector<double> iter_history; ///< History of iterations for plotting.
+  std::vector<int> macro_boundaries; ///< Indices in history where a new macro iteration starts.
+  std::vector<ImVec4> macro_colors; ///< Random colors for each macro iteration.
   std::vector<double>
       energy_history; ///< History of energy values for plotting.
   std::vector<double> base_energy_history;
@@ -210,6 +212,10 @@ private:
 
   bool use_warm_start = false;           ///< Flag to enable warm start.
   std::string filepath_warm_start = "";  ///< Path to warm start JSON file.
+
+  // ADAPT-VQE Options
+  bool use_adapt = false;
+  double adapt_epsilon = 1e-3;
 
   //----------------------------------------------------------------------------
   //     DATA MEMBERS - CONCURRENCY

@@ -56,6 +56,26 @@ struct SPSAResult {
 };
 
 //------------------------------------------------------------------------------
+//     GAIN SEQUENCES (Spall 1998)
+//------------------------------------------------------------------------------
+
+/**
+ * @brief Step size gain: aₖ = a / (A + k)^alpha.  k is 1-based.
+ */
+inline double spsa_gain_a(const SPSAParams &p, int k)
+{
+    return p.a / std::pow(p.A + static_cast<double>(k), p.alpha);
+}
+
+/**
+ * @brief Perturbation gain: cₖ = c / k^gamma.  k is 1-based.
+ */
+inline double spsa_gain_c(const SPSAParams &p, int k)
+{
+    return p.c / std::pow(static_cast<double>(k), p.gamma);
+}
+
+//------------------------------------------------------------------------------
 //     CLASS SPSA_Optimizer
 //------------------------------------------------------------------------------
 
@@ -69,6 +89,9 @@ class SPSA_Optimizer {
 public:
   // Signature matching nlopt::vfunc
   using vfunc = double (*)(const std::vector<double> &x, std::vector<double> &grad, void *data);
+
+  /// Lightweight evaluation function (no gradient, no callback).
+  using eval_fn_t = std::function<double(const std::vector<double> &)>;
 
   /**
    * @brief Construct a new SPSA Optimizer.
@@ -108,6 +131,17 @@ public:
   void set_spsa_params(const SPSAParams &p);
 
   /**
+   * @brief Set a lightweight evaluation function for internal perturbation evals.
+   *
+   * This function is called for f(x+cΔ) and f(x-cΔ) without triggering the
+   * cost_function callback. The full cost_function (set via set_min_objective)
+   * is called once per step after the parameter update.
+   *
+   * @param fn Evaluation function: params -> energy.
+   */
+  void set_eval_function(eval_fn_t fn);
+
+  /**
    * @brief Run optimization.
    * @param x In/Out parameter vector.
    * @param minf Output minimum function value.
@@ -119,6 +153,7 @@ private:
   int dim_;
   vfunc f_ = nullptr;
   void *f_data_ = nullptr;
+  eval_fn_t eval_fn_ = nullptr;
   int max_evals_ = 1000;
   double ftol_rel_ = 1e-8;
   SPSAParams params_;

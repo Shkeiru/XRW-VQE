@@ -139,6 +139,26 @@ public:
    */
   nlohmann::json get_rdms() const;
 
+  /**
+   * @brief Helper function to evaluate functional (energy + 1-RDM) for a given
+   * set of parameters.
+   *
+   * @param params Current parameters.
+   * @param data Pointer to VQEContext struct.
+   * @param local_qubits The quantum register to use for evaluation.
+   * @param rdm1_out Vector to store the output 1-RDM evaluations.
+   * @param out_quantum_energy Optional pointer to store extracted quantum
+   * energy.
+   * @param out_chi_squared Optional pointer to store extracted chi-squared
+   * value.
+   * @return double Calculated total energy value (including penalty).
+   */
+  static double evaluate_functional(const std::vector<double> &params,
+                                    VQEContext *data, Qureg local_qubits,
+                                    std::vector<qcomp> &rdm1_out,
+                                    double *out_quantum_energy = nullptr,
+                                    double *out_chi_squared = nullptr);
+
 private:
   //----------------------------------------------------------------------------
   //     PRIVATE MEMBERS
@@ -168,24 +188,4 @@ private:
    */
   static double cost_function(const std::vector<double> &params,
                               std::vector<double> &grad, void *data);
-
-  /**
-   * @brief Helper function to evaluate functional (energy + 1-RDM) for a given
-   * set of parameters.
-   *
-   * @param params Current parameters.
-   * @param data Pointer to VQEContext struct.
-   * @param local_qubits The quantum register to use for evaluation.
-   * @param rdm1_out Vector to store the output 1-RDM evaluations.
-   * @param out_quantum_energy Optional pointer to store extracted quantum
-   * energy.
-   * @param out_chi_squared Optional pointer to store extracted chi-squared
-   * value.
-   * @return double Calculated total energy value (including penalty).
-   */
-  static double evaluate_functional(const std::vector<double> &params,
-                                    VQEContext *data, Qureg local_qubits,
-                                    std::vector<qcomp> &rdm1_out,
-                                    double *out_quantum_energy = nullptr,
-                                    double *out_chi_squared = nullptr);
 };

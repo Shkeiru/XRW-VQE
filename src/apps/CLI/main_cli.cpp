@@ -11,6 +11,7 @@
 #include "core/logger.hpp"
 #include "core/physics.hpp"
 #include "core/simulation.hpp"
+#include "core/adapt_sim.hpp"
 
 #include <CLI/CLI.hpp>
 #include <nlohmann/json.hpp>
@@ -24,6 +25,8 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -145,6 +148,14 @@ int main(int argc, char **argv) {
   std::string opt_out = "";
   app.add_option("--out", opt_out, "Explicit path for JSON output file");
 
+  // ADAPT options
+  bool opt_adapt = false;
+  double opt_adapt_tol = 1e-3;
+  int opt_adapt_max_iter = 10;
+  app.add_flag("--adapt", opt_adapt, "Enable ADAPT-VQE");
+  app.add_option("--adapt-tol", opt_adapt_tol, "Gradient L2 norm tolerance for ADAPT-VQE");
+  app.add_option("--adapt-max-iter", opt_adapt_max_iter, "Maximum number of ADAPT-VQE macro iterations");
+
   // Warm start options
   std::string opt_warm_start = "";
   app.add_option("--warm-start", opt_warm_start,
@@ -247,30 +258,37 @@ int main(int argc, char **argv) {
     }
 
     // 4. Create VQEContext
-    VQEContext ctx(physics, *ansatz);
-    ctx.n_shots = opt_shots;
-    ctx.lambda = opt_lambda;
-    ctx.setup(opt_factors, opt_integrals);
+    // If not ADAPT, we setup Context and Simulation right here.
+    // If ADAPT, we defer to ADAPT_sim.
+    std::unique_ptr<VQEContext> ctx;
+    std::unique_ptr<Simulation> sim;
 
-    // 5. Create Simulation
-    nlopt::algorithm algo = get_nlopt_algorithm(opt_optimizer);
-    Simulation sim(ctx, algo);
+    if (!opt_adapt) {
+      ctx = std::make_unique<VQEContext>(physics, *ansatz);
+      ctx->n_shots = opt_shots;
+      ctx->lambda = opt_lambda;
+      ctx->setup(opt_factors, opt_integrals);
 
-    if (opt_optimizer == "SPSA") {
-      sim.set_optimizer_type(Simulation::OptType::SPSA);
-      SPSAParams params;
-      params.a = opt_spsa_a;
-      params.c = opt_spsa_c;
-      params.A = opt_spsa_A;
-      params.alpha = opt_spsa_alpha;
-      params.gamma = opt_spsa_gamma;
-      sim.set_spsa_params(params);
-    } else {
-      sim.set_optimizer_type(Simulation::OptType::NLOPT);
+      // 5. Create Simulation
+      nlopt::algorithm algo = get_nlopt_algorithm(opt_optimizer);
+      sim = std::make_unique<Simulation>(*ctx, algo);
+
+      if (opt_optimizer == "SPSA") {
+        sim->set_optimizer_type(Simulation::OptType::SPSA);
+        SPSAParams params;
+        params.a = opt_spsa_a;
+        params.c = opt_spsa_c;
+        params.A = opt_spsa_A;
+        params.alpha = opt_spsa_alpha;
+        params.gamma = opt_spsa_gamma;
+        sim->set_spsa_params(params);
+      } else {
+        sim->set_optimizer_type(Simulation::OptType::NLOPT);
+      }
+
+      sim->set_max_evals(opt_max_iter);
+      sim->set_tolerance(opt_tolerance);
     }
-
-    sim.set_max_evals(opt_max_iter);
-    sim.set_tolerance(opt_tolerance);
 
     // Required history arrays
     std::vector<double> iter_history;
@@ -317,6 +335,15 @@ int main(int argc, char **argv) {
 
     spdlog::info(">>> Starting XRW-VQE... (Simulation)");
     std::vector<double> params(ansatz->get_num_params(), 0);
+
+    // Small random perturbation to break zero-initialization symmetry
+    // (avoids vanishing PSR gradients at the Hartree-Fock saddle point)
+    {
+      std::mt19937 rng(std::random_device{}());
+      std::uniform_real_distribution<double> dist(-1e-3, 1e-3);
+      for (auto& p : params) p = dist(rng);
+      spdlog::info("Initial parameters perturbed with uniform noise in [-0.001, 0.001] rad");
+    }
 
     // --- Warm Start: Load parameters from file if provided ---
     if (!opt_warm_start.empty()) {
@@ -385,22 +412,36 @@ int main(int argc, char **argv) {
     std::string status_message = "XRW-VQE terminated.";
 
     try {
-      noisy_energy = sim.run(params, callback);
+      if (opt_adapt) {
+        ADAPT_sim adapt_sim(physics,
+                            opt_optimizer, opt_max_iter, opt_tolerance, opt_adapt_tol,
+                            opt_shots, opt_lambda, opt_factors, opt_integrals,
+                            opt_out, opt_adapt_max_iter,
+                            callback);
+        adapt_sim.run_adapt();
+        status_message = "ADAPT-VQE terminated successfully.";
+      } else {
+        noisy_energy = sim->run(params, callback);
 
-      // Re-fetch final probabilities using the sim method for output
-      counts_values = sim.get_probabilities(params);
+        // Re-fetch final probabilities using the sim method for output
+        counts_values = sim->get_probabilities(params);
 
-      // Log final optimized parameters
-      std::string params_str = "[ ";
-      for (size_t i = 0; i < params.size(); ++i) {
-        params_str +=
-            std::to_string(params[i]) + (i < params.size() - 1 ? ", " : " ]");
+        // Log final optimized parameters
+        std::string params_str = "[ ";
+        for (size_t i = 0; i < params.size(); ++i) {
+          params_str +=
+              std::to_string(params[i]) + (i < params.size() - 1 ? ", " : " ]");
+        }
+        spdlog::info("Final optimized parameters: {}", params_str);
       }
-      spdlog::info("Final optimized parameters: {}", params_str);
-
     } catch (const std::exception &e) {
       spdlog::error("Simulation error: {}", e.what());
       status_message = "XRW-VQE terminated with error.";
+    }
+
+    if (opt_adapt) {
+      finalizeQuESTEnv();
+      return EXIT_SUCCESS;
     }
 
     // 5. Generate JSON strictly identical to GUI::SaveRun()
@@ -495,7 +536,7 @@ int main(int argc, char **argv) {
       rdm_filename = "rdms_" + filename;
     }
     std::ofstream rdm_out(rdm_filename);
-    rdm_out << std::setw(4) << sim.get_rdms() << std::endl;
+    rdm_out << std::setw(4) << sim->get_rdms() << std::endl;
     spdlog::info("RDMs saved to: {}", rdm_filename);
 
     // --- Warm Start Export ---

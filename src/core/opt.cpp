@@ -52,24 +52,11 @@ void apply_bounds(std::vector<double>       &x,
     }
 }
 
-/**
- * @brief Gain sequences (Spall 1998).
- *   aₖ = a / (A + k)^alpha
- *   cₖ = c / k^gamma
- *
- * k is 1-based (first iteration k=1).
- */
-inline double gain_a(const SPSAParams &p, int k)
-{
-    return p.a / std::pow(p.A + static_cast<double>(k), p.alpha);
-}
-
-inline double gain_c(const SPSAParams &p, int k)
-{
-    return p.c / std::pow(static_cast<double>(k), p.gamma);
-}
-
 } // anonymous namespace
+
+// Use the header-exposed gain functions throughout this file.
+static inline double gain_a(const SPSAParams &p, int k) { return spsa_gain_a(p, k); }
+static inline double gain_c(const SPSAParams &p, int k) { return spsa_gain_c(p, k); }
 
 //------------------------------------------------------------------------------
 //     IMPLEMENTATION
@@ -202,18 +189,84 @@ void SPSA_Optimizer::set_spsa_params(const SPSAParams &p) {
   params_ = p;
 }
 
+void SPSA_Optimizer::set_eval_function(eval_fn_t fn) {
+  eval_fn_ = std::move(fn);
+}
+
 nlopt::result SPSA_Optimizer::optimize(std::vector<double> &x, double &minf) {
   if (!f_) {
     throw std::runtime_error("SPSA_Optimizer: objective function not set.");
   }
+  if (!eval_fn_) {
+    throw std::runtime_error("SPSA_Optimizer: eval function not set. "
+                             "Call set_eval_function() before optimize().");
+  }
 
-  // Wrap the vfunc into a std::function for the existing spsa_optimize
-  auto f_wrapper = [this](const std::vector<double> &params) -> double {
-    std::vector<double> dummy_grad;
-    return this->f_(params, dummy_grad, this->f_data_);
-  };
+  const std::size_t n = static_cast<std::size_t>(dim_);
 
-  SPSAResult res = spsa_optimize(f_wrapper, x, {}, {}, params_, max_evals_, ftol_rel_, 0);
-  minf = res.minval;
-  return res.status;
+  // RNG — Bernoulli ±1
+  std::mt19937 rng(std::random_device{}());
+  std::bernoulli_distribution coin(0.5);
+
+  // Working vectors
+  std::vector<double> x_plus(n), x_minus(n), delta(n);
+  std::vector<double> x_best = x;
+  std::vector<double> dummy_grad;
+
+  // Evaluate initial point via cost_function (fires callback)
+  double f_curr = f_(x, dummy_grad, f_data_);
+  double f_prev = f_curr;
+  double f_best = f_curr;
+  int    n_iters = 0;
+
+  // ------------------------------------------------------------------ loop
+  // max_evals_ is now the number of STEPS, not raw function evaluations.
+  while (n_iters < max_evals_) {
+
+    ++n_iters;
+    const int    k  = n_iters;
+    const double ak = gain_a(params_, k);
+    const double ck = gain_c(params_, k);
+
+    // --- Draw Bernoulli ±1 perturbation vector
+    for (std::size_t i = 0; i < n; ++i)
+      delta[i] = coin(rng) ? 1.0 : -1.0;
+
+    // --- Build x±
+    for (std::size_t i = 0; i < n; ++i) {
+      x_plus[i]  = x[i] + ck * delta[i];
+      x_minus[i] = x[i] - ck * delta[i];
+    }
+
+    // --- Two internal evaluations via eval_fn_ (NO callback)
+    const double f_plus  = eval_fn_(x_plus);
+    const double f_minus = eval_fn_(x_minus);
+
+    // --- Simultaneous gradient approximation + parameter update
+    const double diff = f_plus - f_minus;
+    for (std::size_t i = 0; i < n; ++i)
+      x[i] -= ak * diff / (2.0 * ck * delta[i]);
+
+    // --- Evaluate at updated point via cost_function (fires callback)
+    f_curr = f_(x, dummy_grad, f_data_);
+
+    // --- Track best point seen
+    if (f_curr < f_best) { f_best = f_curr;  x_best = x; }
+    if (f_plus < f_best) { f_best = f_plus;  x_best = x_plus; }
+    if (f_minus < f_best){ f_best = f_minus; x_best = x_minus; }
+
+    // --- ftol_rel stopping criterion
+    if (ftol_rel_ > 0.0 && std::abs(f_prev) > 0.0) {
+      if (std::abs(f_curr - f_prev) / std::abs(f_prev) < ftol_rel_)
+        break;
+    }
+    f_prev = f_curr;
+  }
+
+  // Return best known point
+  x = x_best;
+  minf = f_best;
+
+  return (n_iters >= max_evals_) ? nlopt::MAXEVAL_REACHED
+                                : nlopt::FTOL_REACHED;
 }

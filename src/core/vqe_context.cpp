@@ -108,7 +108,8 @@ void VQEContext::setup(const std::string &fcalc_path, const std::string &ft_int_
 #ifdef _WIN32
     command = "wsl ";
 #endif
-    command += "python3 python/generate_1rdm.py --n_qubits " + std::to_string(num_qubits) + " --mapping jordan_wigner";
+    command += "python3 ./python/generate_1rdm.py --n_qubits " +
+               std::to_string(physics.get_num_qubits()) + " --mapping jordan_wigner";
 
     spdlog::info("[VQEContext] Generating 1-RDM mapping: {}", command);
 
