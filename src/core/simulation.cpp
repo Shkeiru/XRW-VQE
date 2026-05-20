@@ -319,75 +319,103 @@ double Simulation::cost_function(const std::vector<double> &params,
       }
     }
 
-    // Initialize Qureg
-    Qureg local_qubits = createQureg(data->num_qubits);
+    // Save variance and standard deviation pointers to prevent parallel data races
+    double *saved_variance_ptr = data->variance_ptr;
+    double *saved_std_ptr = data->std_ptr;
+    data->variance_ptr = nullptr;
+    data->std_ptr = nullptr;
 
-    // Helper lambda for shifted circuit evaluation (generalized PSR path)
-    auto eval_shifted = [&](const std::vector<double>& p, int param_idx,
-                            int gate_idx, double shift) -> double {
-      initZeroState(local_qubits);
-      for (int e = 0; e < data->n_electrons; ++e) {
-        applyPauliX(local_qubits, e);
-      }
-      data->ansatz.construct_circuit_with_shift(
-          local_qubits, p, data->paulis, param_idx, gate_idx, shift);
-      return calcExpecPauliStrSum(local_qubits, data->hamiltonian);
-    };
+#ifdef _OPENMP
+    int saved_active_levels = omp_get_max_active_levels();
+    omp_set_max_active_levels(1); // Restrict nesting levels to prevent oversubscription inside QuEST
+#endif
 
-    // Evaluate parameter shifts sequentially to allow QuEST/Eigen to fully
-    // utilize threads
     std::exception_ptr global_exception = nullptr;
-    for (int i = 0; i < num_params; ++i) {
-      if (global_exception)
-        continue;
 
-      try {
-        int M = multiplicities[i];
+#pragma omp parallel
+    {
+#ifdef _OPENMP
+      omp_set_num_threads(1); // Restrict child thread counts for nested loops inside QuEST
+#endif
 
-        if (M == 1) {
-          // ── FAST PATH: standard PSR (unchanged, zero overhead) ──
-          std::vector<double> shifted_params = params;
-          std::vector<qcomp> rdm1_plus;
-          std::vector<qcomp> rdm1_minus;
+      // Initialize thread-local Qureg
+      Qureg thread_qubits = createQureg(data->num_qubits);
 
-          // Shift +π/2
-          shifted_params[i] = params[i] + M_PI / 2.0;
-          double e_plus =
-              evaluate_functional(shifted_params, data, local_qubits, rdm1_plus);
+      // Thread-local RDM buffers to avoid heap allocations in the loop
+      std::vector<qcomp> rdm1_plus;
+      std::vector<qcomp> rdm1_minus;
 
-          // Shift -π/2
-          shifted_params[i] = params[i] - M_PI / 2.0;
-          double e_minus =
-              evaluate_functional(shifted_params, data, local_qubits, rdm1_minus);
+      // Thread-local helper lambda for shifted circuit evaluation (generalized PSR path)
+      auto eval_shifted_thread = [&](const std::vector<double>& p, int param_idx,
+                                     int gate_idx, double shift) -> double {
+        initZeroState(thread_qubits);
+        for (int e = 0; e < data->n_electrons; ++e) {
+          applyPauliX(thread_qubits, e);
+        }
+        data->ansatz.construct_circuit_with_shift(
+            thread_qubits, p, data->paulis, param_idx, gate_idx, shift);
+        return calcExpecPauliStrSum(thread_qubits, data->hamiltonian);
+      };
 
-          // Parameter Shift Rule formula
-          grad[i] = 0.5 * (e_plus - e_minus);
-        } else {
-          // ── GENERALIZED PSR: sum over per-gate contributions ──
-          grad[i] = 0.0;
-          for (int gate_idx = 0; gate_idx < M; ++gate_idx) {
-            double e_plus = eval_shifted(params, i, gate_idx, M_PI / 2.0);
-            double e_minus = eval_shifted(params, i, gate_idx, -M_PI / 2.0);
-            grad[i] += 0.5 * (e_plus - e_minus);
+#pragma omp for schedule(dynamic)
+      for (int i = 0; i < num_params; ++i) {
+        if (global_exception)
+          continue;
+
+        try {
+          int M = multiplicities[i];
+
+          if (M == 1) {
+            // ── FAST PATH: standard PSR (unchanged, zero overhead) ──
+            std::vector<double> shifted_params = params;
+
+            // Shift +π/2
+            shifted_params[i] = params[i] + M_PI / 2.0;
+            double e_plus =
+                evaluate_functional(shifted_params, data, thread_qubits, rdm1_plus);
+
+            // Shift -π/2
+            shifted_params[i] = params[i] - M_PI / 2.0;
+            double e_minus =
+                evaluate_functional(shifted_params, data, thread_qubits, rdm1_minus);
+
+            // Parameter Shift Rule formula
+            grad[i] = 0.5 * (e_plus - e_minus);
+          } else {
+            // ── GENERALIZED PSR: sum over per-gate contributions ──
+            double g_val = 0.0;
+            for (int gate_idx = 0; gate_idx < M; ++gate_idx) {
+              double e_plus = eval_shifted_thread(params, i, gate_idx, M_PI / 2.0);
+              double e_minus = eval_shifted_thread(params, i, gate_idx, -M_PI / 2.0);
+              g_val += 0.5 * (e_plus - e_minus);
+            }
+            grad[i] = g_val;
+          }
+        } catch (...) {
+#pragma omp critical
+          {
+            if (!global_exception) {
+              global_exception = std::current_exception();
+            }
           }
         }
-
-        // Reset the Qureg
-        initZeroState(local_qubits);
-      } catch (...) {
-        if (!global_exception) {
-          global_exception = std::current_exception();
-        }
       }
+
+      // Destroy thread-local Qureg
+      destroyQureg(thread_qubits);
     }
+
+    // Restore variance and standard deviation pointers
+    data->variance_ptr = saved_variance_ptr;
+    data->std_ptr = saved_std_ptr;
+
+#ifdef _OPENMP
+    omp_set_max_active_levels(saved_active_levels);
+#endif
 
     if (global_exception) {
-      // Destroy Qureg before rethrowing
-      destroyQureg(local_qubits);
       std::rethrow_exception(global_exception);
     }
-    // Destroy Qureg
-    destroyQureg(local_qubits);
   }
 
   // Execute callback if provided (e.g., for GUI updates)
