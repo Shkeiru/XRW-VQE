@@ -100,7 +100,9 @@ double Simulation::evaluate_functional(const std::vector<double> &params,
                                        VQEContext *data, Qureg local_qubits,
                                        std::vector<qcomp> &rdm1_out,
                                        double *out_quantum_energy,
-                                       double *out_chi_squared) {
+                                       double *out_chi_squared,
+                                       Ansatz *override_ansatz,
+                                       bool save_to_context) {
 
   // Prepare rdm1_out vector for 1-RDM results
   rdm1_out.assign(data->rdm1_operators.size(), 0.0);
@@ -115,7 +117,8 @@ double Simulation::evaluate_functional(const std::vector<double> &params,
   }
 
   // Apply the parameterized variational circuit (Ansatz)
-  data->ansatz.construct_circuit(local_qubits, params, data->paulis);
+  Ansatz &active_ansatz = override_ansatz ? *override_ansatz : data->ansatz;
+  active_ansatz.construct_circuit(local_qubits, params, data->paulis);
 
   double energy = 0.0;
   double variance = 0.0;
@@ -202,30 +205,11 @@ double Simulation::evaluate_functional(const std::vector<double> &params,
   //--------------------------------------------------------------------------
   for (size_t idx = 0; idx < data->rdm1_operators.size(); ++idx) {
     const auto &rdm_term = data->rdm1_operators[idx];
-    qcomp term_expectation = 0.0;
-
-    for (size_t s = 0; s < rdm_term.strings.size(); ++s) {
-      if (std::abs(rdm_term.coeffs[s].real()) < 1e-9 &&
-          std::abs(rdm_term.coeffs[s].imag()) < 1e-9) {
-        continue;
-      }
-
-      double p_expect_real;
-      if (data->n_shots > 0) {
-        // In noisy sim we should ideally sample the 1-RDM individually as well,
-        // we reuse exact for fast prototyping. Usually, 1-RDM is measured
-        // during the same shot batch unless mapping requires separate bases.
-      }
-
-      qcomp one = 1.0;
-      PauliStr p_arr[] = {rdm_term.strings[s]};
-      PauliStrSum temp_sum = createPauliStrSum(p_arr, &one, 1);
-      p_expect_real = calcExpecPauliStrSum(local_qubits, temp_sum);
-      destroyPauliStrSum(temp_sum);
-
-      term_expectation += rdm_term.coeffs[s] * p_expect_real;
-    }
-    rdm1_out[idx] = term_expectation;
+    
+    double val_real = calcExpecPauliStrSum(local_qubits, rdm_term.quest_sum_real);
+    double val_imag = calcExpecPauliStrSum(local_qubits, rdm_term.quest_sum_imag);
+    
+    rdm1_out[idx] = qcomp(val_real, val_imag);
   }
 
   if (out_quantum_energy)
@@ -233,13 +217,11 @@ double Simulation::evaluate_functional(const std::vector<double> &params,
   if (out_chi_squared)
     *out_chi_squared = 0.0;
 
-  if (!data->current_1rdm.empty()) {
+  if (data->integrals.size() > 0) {
     int n_orbs = data->num_qubits / 2;
-    data->rdm1_alpha.resize(n_orbs * n_orbs);
-    data->rdm1_beta.resize(n_orbs * n_orbs);
-    data->rdm1_spatial.resize(n_orbs * n_orbs);
-    data->rdm1_alpha.setZero();
-    data->rdm1_beta.setZero();
+    Eigen::VectorXcd local_rdm1_alpha = Eigen::VectorXcd::Zero(n_orbs * n_orbs);
+    Eigen::VectorXcd local_rdm1_beta = Eigen::VectorXcd::Zero(n_orbs * n_orbs);
+    Eigen::VectorXcd local_rdm1_spatial;
 
     // Sum over alpha and beta components
     for (size_t idx = 0; idx < data->rdm1_operators.size(); ++idx) {
@@ -250,25 +232,29 @@ double Simulation::evaluate_functional(const std::vector<double> &params,
       int spatial_idx = p_spatial * n_orbs + q_spatial;
 
       if (p % 2 == 0 && q % 2 == 0) {
-        data->rdm1_alpha(spatial_idx) += rdm1_out[idx];
+        local_rdm1_alpha(spatial_idx) += rdm1_out[idx];
       } else if (p % 2 == 1 && q % 2 == 1) {
-        data->rdm1_beta(spatial_idx) += rdm1_out[idx];
+        local_rdm1_beta(spatial_idx) += rdm1_out[idx];
       }
     }
 
-    data->rdm1_spatial = data->rdm1_alpha + data->rdm1_beta;
+    local_rdm1_spatial = local_rdm1_alpha + local_rdm1_beta;
 
-    if (data->integrals.size() > 0) {
-      // Perform the matrix-vector multiplication to get the theoretical factors
-      Eigen::VectorXcd calc_factors = data->integrals * data->rdm1_spatial;
+    // Perform the matrix-vector multiplication to get the theoretical factors
+    Eigen::VectorXcd calc_factors = data->integrals * local_rdm1_spatial;
 
       // Computation of eta
       double eta = (calc_factors.array().abs() * data->exp_factors.array().abs() / data->uncertainties.array().abs2()).sum() /
              (calc_factors.array().abs2() / data->uncertainties.array().abs2()).sum();
 
       // Store for debug output
-      data->last_eta = eta;
-      data->last_calc_factors_abs = calc_factors.cwiseAbs().cast<double>();
+      if (save_to_context) {
+        data->rdm1_alpha = local_rdm1_alpha;
+        data->rdm1_beta = local_rdm1_beta;
+        data->rdm1_spatial = local_rdm1_spatial;
+        data->last_eta = eta;
+        data->last_calc_factors_abs = calc_factors.cwiseAbs().cast<double>();
+      }
 
       double chi_squared =
           (1.0 / data->exp_factors.size()) *
@@ -280,7 +266,6 @@ double Simulation::evaluate_functional(const std::vector<double> &params,
       if (out_chi_squared)
         *out_chi_squared = chi_squared;
       energy += data->lambda * chi_squared;
-    }
   }
 
   return energy;
@@ -295,7 +280,7 @@ double Simulation::cost_function(const std::vector<double> &params,
   double current_chi_squared = 0.0;
 
   // 1. Calculate the energy of the current point on the main register
-  double base_energy = evaluate_functional(params, data, data->qubits, data->current_1rdm, &current_quantum_energy, &current_chi_squared);
+  double base_energy = evaluate_functional(params, data, data->qubits, data->current_1rdm, &current_quantum_energy, &current_chi_squared, nullptr, true);
 
   // 2. Calculate the local gradients using Parameter Shift Rule (PSR)
   // Supports both standard PSR (M=1) and generalized PSR (M>1) for shared params
@@ -529,7 +514,7 @@ double Simulation::run(
   spdlog::info("[Simulation] Evaluating final 1-RDM and 2-RDM...");
 
   std::vector<qcomp> final_1rdm_vals;
-  evaluate_functional(optimal_params, &ctx, ctx.qubits, final_1rdm_vals);
+  evaluate_functional(optimal_params, &ctx, ctx.qubits, final_1rdm_vals, nullptr, nullptr, nullptr, true);
 
   nlohmann::json rdm_output;
   nlohmann::json rdm1_json = nlohmann::json::array();

@@ -38,6 +38,10 @@ struct RDM1Term {
   int q;
   std::vector<PauliStr> strings;
   std::vector<qcomp> coeffs;
+  
+  PauliStrSum quest_sum_real;
+  PauliStrSum quest_sum_imag;
+  bool has_quest_sums = false;
 };
 
 /**

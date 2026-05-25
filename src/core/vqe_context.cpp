@@ -46,6 +46,14 @@ void VQEContext::free_quest_resources() {
     destroyPauliStrSum(sum);
   }
   single_term_sums.clear();
+  
+  for (auto &op : rdm1_operators) {
+    if (op.has_quest_sums) {
+      destroyPauliStrSum(op.quest_sum_real);
+      destroyPauliStrSum(op.quest_sum_imag);
+      op.has_quest_sums = false;
+    }
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -156,8 +164,22 @@ void VQEContext::setup(const std::string &fcalc_path, const std::string &ft_int_
 
     int current_idx = 0;
     for (auto &pair : rdm_map) {
-      rdm1_operators.push_back(pair.second);
-      rdm1_index_map[{pair.second.p, pair.second.q}] = current_idx++;
+      RDM1Term& term = pair.second;
+      
+      std::vector<qcomp> real_coeffs(term.coeffs.size());
+      std::vector<qcomp> imag_coeffs(term.coeffs.size());
+      
+      for (size_t i = 0; i < term.coeffs.size(); ++i) {
+        real_coeffs[i] = term.coeffs[i].real();
+        imag_coeffs[i] = term.coeffs[i].imag();
+      }
+      
+      term.quest_sum_real = createPauliStrSum(term.strings.data(), real_coeffs.data(), term.strings.size());
+      term.quest_sum_imag = createPauliStrSum(term.strings.data(), imag_coeffs.data(), term.strings.size());
+      term.has_quest_sums = true;
+      
+      rdm1_operators.push_back(term);
+      rdm1_index_map[{term.p, term.q}] = current_idx++;
     }
 
     spdlog::info("[VQEContext] Successfully parsed {} operator groups for 1-RDM", rdm1_operators.size());

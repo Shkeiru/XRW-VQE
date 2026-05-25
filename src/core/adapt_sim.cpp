@@ -4,6 +4,10 @@
 #include <fstream>
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#include <atomic>
 
 using json = nlohmann::json;
 
@@ -104,33 +108,71 @@ void ADAPT_sim::run_adapt() {
     double grad_l2_norm = 0.0;
 
     // Gradient Evaluation via PSR
-    for (size_t i = 0; i < pool.size(); ++i) {
-      ansatz.add_operator(pool[i]);
-      
-      std::vector<double> params_plus = current_params;
-      params_plus.push_back(3.14159265358979323846 / 2.0);
-      
-      std::vector<double> params_minus = current_params;
-      params_minus.push_back(-3.14159265358979323846 / 2.0);
+#ifdef _OPENMP
+    int saved_active_levels = omp_get_max_active_levels();
+    omp_set_max_active_levels(1); // Restrict nesting levels
+#endif
 
-      std::vector<qcomp> dummy_rdm;
-      double e_plus = Simulation::evaluate_functional(params_plus, &ctx, ctx.qubits, dummy_rdm);
-      double e_minus = Simulation::evaluate_functional(params_minus, &ctx, ctx.qubits, dummy_rdm);
+    std::atomic<int> completed_gradients(0);
 
-      double grad = 0.5 * (e_plus - e_minus);
-      gradients[i] = grad;
-      grad_l2_norm += grad * grad;
+#pragma omp parallel
+    {
+#ifdef _OPENMP
+      omp_set_num_threads(1); // Restrict child thread counts
+#endif
+      Qureg thread_qubits = createQureg(physics.get_num_qubits());
+      ADAPTAnsatz thread_ansatz = ansatz;
 
-      if (std::abs(grad) > max_grad_abs) {
-        max_grad_abs = std::abs(grad);
-        best_op_idx = i;
+      double thread_max_grad = 0.0;
+      int thread_best_idx = -1;
+      double thread_l2 = 0.0;
+
+#pragma omp for
+      for (int i = 0; i < (int)pool.size(); ++i) {
+        thread_ansatz.add_operator(pool[i]);
+        
+        std::vector<double> params_plus = current_params;
+        params_plus.push_back(3.14159265358979323846 / 2.0);
+        
+        std::vector<double> params_minus = current_params;
+        params_minus.push_back(-3.14159265358979323846 / 2.0);
+
+        std::vector<qcomp> dummy_rdm;
+        double e_plus = Simulation::evaluate_functional(params_plus, &ctx, thread_qubits, dummy_rdm, nullptr, nullptr, &thread_ansatz);
+        double e_minus = Simulation::evaluate_functional(params_minus, &ctx, thread_qubits, dummy_rdm, nullptr, nullptr, &thread_ansatz);
+
+        double grad = 0.5 * (e_plus - e_minus);
+        gradients[i] = grad;
+        thread_l2 += grad * grad;
+
+        if (std::abs(grad) > thread_max_grad) {
+          thread_max_grad = std::abs(grad);
+          thread_best_idx = i;
+        }
+
+        thread_ansatz.remove_last_operator();
+        
+        int current_completed = ++completed_gradients;
+        if (current_completed % 10 == 0 || current_completed == (int)pool.size()) {
+          spdlog::info("[ADAPT_sim] {} gradients processed out of {}", current_completed, pool.size());
+        }
       }
 
-      ansatz.remove_last_operator();
-      if (i % 10 == 0) {
-        spdlog::info("[ADAPT_sim] Gradient {} out of {}", i, pool.size());
+#pragma omp critical
+      {
+        grad_l2_norm += thread_l2;
+        if (thread_max_grad > max_grad_abs) {
+          max_grad_abs = thread_max_grad;
+          best_op_idx = thread_best_idx;
+        }
       }
+
+      destroyQureg(thread_qubits);
     }
+    
+#ifdef _OPENMP
+    omp_set_max_active_levels(saved_active_levels); // Restore nesting levels
+#endif
 
     grad_l2_norm = std::sqrt(grad_l2_norm);
     spdlog::info("[ADAPT_sim] Gradient L2 Norm: {:.6f} (Max abs grad: {:.6f})", grad_l2_norm, max_grad_abs);

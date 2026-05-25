@@ -157,7 +157,9 @@ public:
                                     VQEContext *data, Qureg local_qubits,
                                     std::vector<qcomp> &rdm1_out,
                                     double *out_quantum_energy = nullptr,
-                                    double *out_chi_squared = nullptr);
+                                    double *out_chi_squared = nullptr,
+                                    Ansatz *override_ansatz = nullptr,
+                                    bool save_to_context = false);
 
 private:
   //----------------------------------------------------------------------------
