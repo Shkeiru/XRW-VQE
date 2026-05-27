@@ -57,12 +57,14 @@ private:
   std::string output_json_path;
   int max_macro_iter;
   
+  GradientMethod grad_method;
+  double fd_tol;
   std::function<void(int, double, double, double, const std::vector<double>&, const std::vector<double>&)> callback;
 
 public:
   ADAPT_sim(Physics& physics,
             std::string optimizer_name, int max_evals, double vqe_tol, double adapt_epsilon,
-            int n_shots, double lambda_val,
+            int n_shots, double lambda_val, GradientMethod grad_method, double fd_tol,
             std::string fcalc_path, std::string ft_int_path, std::string output_json_path,
             int max_macro_iter,
             std::function<void(int, double, double, double, const std::vector<double>&, const std::vector<double>&)> callback);

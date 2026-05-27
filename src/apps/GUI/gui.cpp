@@ -186,6 +186,12 @@ void GUI::DrawConfiguration() {
   ImGui::Text("Optimiseur:");
   ImGui::Combo("##opt", &optimizer_idx, optimizers.data(), optimizers.size());
 
+  ImGui::Text("Méthode de Gradient:");
+  ImGui::Combo("##grad_method", &grad_method_idx, grad_methods.data(), grad_methods.size());
+  if (grad_method_idx == 0) { // Finite Difference
+    ImGui::InputDouble("Tolérance FD", &fd_tol, 0.0, 0.0, "%.1e");
+  }
+
   if (std::string(optimizers[optimizer_idx]) == "SPSA") {
     ImGui::SeparatorText("SPSA Hyperparametres");
     ImGui::InputDouble("Step size (a)", &spsa_a, 0.0, 0.0, "%.3f");
@@ -220,14 +226,17 @@ void GUI::DrawConfiguration() {
   //--------------------------------------------------------------------------
   // Ansatz Configuration
   //--------------------------------------------------------------------------
-  ImGui::SeparatorText("3. Ansatz");
-  ImGui::Combo("Type", &ansatz_idx, ansatz_types.data(), ansatz_types.size());
+  if (!use_adapt) {
+    ImGui::SeparatorText("3. Ansatz");
+    ImGui::Combo("Type", &ansatz_idx, ansatz_types.data(), ansatz_types.size());
 
-  if (ansatz_idx == 0) { // HEA
-    ImGui::SliderInt("Depth", &hea_depth, 1, 20);
-  } else { // UCCSD
-    ImGui::Text("UCCSD utilise les excitations simples et doubles.");
-    ImGui::Text("Mapping: %s", mappings[mapping_idx]);
+    if (ansatz_idx == 0) { // HEA
+      ImGui::SliderInt("Depth", &hea_depth, 1, 20);
+      ImGui::Checkbox("Inclure partie HF", &hea_include_hf);
+    } else { // UCCSD
+      ImGui::Text("UCCSD utilise les excitations simples et doubles.");
+      ImGui::Text("Mapping: %s", mappings[mapping_idx]);
+    }
   }
 
   ImGui::Spacing();
@@ -240,19 +249,21 @@ void GUI::DrawConfiguration() {
   //--------------------------------------------------------------------------
   // Warm Start (Optional)
   //--------------------------------------------------------------------------
-  ImGui::SeparatorText("3.5 Warm Start (Optionnel)");
-  ImGui::Checkbox("Utiliser Warm Start", &use_warm_start);
-  if (use_warm_start) {
-    if (ImGui::Button("Choisir Fichier Warm Start")) {
-      IGFD::FileDialogConfig config;
-      config.path = ".";
-      ImGuiFileDialog::Instance()->OpenDialog(
-          "ChooseWarmStart", "Choisir Fichier Warm Start", ".json", config);
+  if (!use_adapt) {
+    ImGui::SeparatorText("3.5 Warm Start (Optionnel)");
+    ImGui::Checkbox("Utiliser Warm Start", &use_warm_start);
+    if (use_warm_start) {
+      if (ImGui::Button("Choisir Fichier Warm Start")) {
+        IGFD::FileDialogConfig config;
+        config.path = ".";
+        ImGuiFileDialog::Instance()->OpenDialog(
+            "ChooseWarmStart", "Choisir Fichier Warm Start", ".json", config);
+      }
+      ImGui::SameLine();
+      ImGui::TextWrapped(
+          "%s",
+          filepath_warm_start.empty() ? "Aucun" : filepath_warm_start.c_str());
     }
-    ImGui::SameLine();
-    ImGui::TextWrapped(
-        "%s",
-        filepath_warm_start.empty() ? "Aucun" : filepath_warm_start.c_str());
   }
 
   //--------------------------------------------------------------------------
@@ -373,11 +384,14 @@ void GUI::DrawConfiguration() {
           is_diffraction_ready ? filepath_integrals : "";
       std::string factors_path = is_diffraction_ready ? filepath_factors : "";
       double current_lambda = lambda_diffraction;
+      int current_grad_method_idx = grad_method_idx;
+      double current_fd_tol = fd_tol;
 
       calculation_thread = std::thread(
           [this, selected_algo, current_optimizer_name, current_ansatz_idx, current_depth, current_map,
            integrals_path, factors_path, current_lambda, is_spsa, s_a, s_c, s_A,
-           s_alpha, s_gamma,
+           s_alpha, s_gamma, current_grad_method_idx, current_fd_tol,
+           hf_enabled = hea_include_hf,
            ws_enabled = use_warm_start,
            ws_path = use_warm_start ? filepath_warm_start : std::string("")]() {
             try {
@@ -388,7 +402,7 @@ void GUI::DrawConfiguration() {
               std::unique_ptr<Ansatz> ansatz;
               if (current_ansatz_idx == 0) {
                 ansatz = std::make_unique<HEA>(physics.get_num_qubits(),
-                                               current_depth);
+                                               current_depth, hf_enabled, physics.get_n_electrons());
               } else {
                 // Format mapping string
                 std::string map_str = current_map;
@@ -406,48 +420,57 @@ void GUI::DrawConfiguration() {
               std::unique_ptr<VQEContext> ctx;
               std::unique_ptr<Simulation> sim;
 
-              if (use_adapt) {
-                spdlog::info(">>> Starting ADAPT-VQE Mode...");
-                ADAPT_sim adapt_sim(physics,
-                                    current_optimizer_name, max_iter, tolerance, adapt_epsilon,
-                                    shots, current_lambda, factors_path, integrals_path,
-                                    "adapt_gui_out.json", 10,
-                                    [this](int iter, double total_energy, double quantum_energy,
-                                           double chi_squared, const std::vector<double> &probs,
-                                           const std::vector<double> &cb_params) {
-                                      std::lock_guard<std::mutex> lock(graph_mutex);
-                                      if (iter == 1 || iter_history.empty()) {
-                                        macro_boundaries.push_back(iter_history.size());
-                                        // Generate random color for this macro iteration
-                                        float r = 0.3f + (float)rand() / (float)RAND_MAX * 0.7f;
-                                        float g = 0.3f + (float)rand() / (float)RAND_MAX * 0.7f;
-                                        float b = 0.3f + (float)rand() / (float)RAND_MAX * 0.7f;
-                                        macro_colors.push_back(ImVec4(r, g, b, 1.0f));
-                                      }
-                                      iter_history.push_back((double)(iter_history.size() + 1));
-                                      energy_history.push_back(total_energy);
-                                      base_energy_history.push_back(quantum_energy);
-                                      chi_squared_history.push_back(chi_squared);
-                                      probs_history.push_back(probs);
-                                      params_history.push_back(cb_params);
-                                      current_energy = total_energy;
-                                      current_base_energy = quantum_energy;
-                                      current_chi_squared = chi_squared;
-                                      counts_values = probs;
-                                      current_iter = iter;
-                                      if (total_energy < best_energy)
-                                        best_energy = total_energy;
-                                    });
-                adapt_sim.run_adapt();
+              GradientMethod chosen_grad_method = GradientMethod::PSR;
+              if (current_grad_method_idx == 0) chosen_grad_method = GradientMethod::FD;
+              else if (current_grad_method_idx == 2) chosen_grad_method = GradientMethod::gPSR;
 
-                std::lock_guard<std::mutex> lock(graph_mutex);
-                is_running = false;
-                status_message = "ADAPT-VQE Termine.";
-              } else {
-                ctx = std::make_unique<VQEContext>(physics, *ansatz);
-                ctx->n_shots = shots;
-                ctx->lambda = current_lambda;
-                ctx->setup(factors_path, integrals_path);
+                if (use_adapt) {
+                  spdlog::info(">>> Starting ADAPT-VQE Mode...");
+                  ADAPT_sim adapt_sim(physics,
+                                      current_optimizer_name, max_iter, tolerance, adapt_epsilon,
+                                      shots, current_lambda, chosen_grad_method, current_fd_tol,
+                                      factors_path, integrals_path,
+                                      "adapt_gui_out.json", 10,
+                                      [this](int iter, double total_energy, double quantum_energy,
+                                             double chi_squared, const std::vector<double> &probs,
+                                             const std::vector<double> &cb_params) {
+                                        std::lock_guard<std::mutex> lock(graph_mutex);
+                                        if (iter == 1 || iter_history.empty()) {
+                                          macro_boundaries.push_back(iter_history.size());
+                                          // Generate random color for this macro iteration
+                                          float r = 0.3f + (float)rand() / (float)RAND_MAX * 0.7f;
+                                          float g = 0.3f + (float)rand() / (float)RAND_MAX * 0.7f;
+                                          float b = 0.3f + (float)rand() / (float)RAND_MAX * 0.7f;
+                                          macro_colors.push_back(ImVec4(r, g, b, 1.0f));
+                                        }
+                                        iter_history.push_back((double)(iter_history.size() + 1));
+                                        energy_history.push_back(total_energy);
+                                        base_energy_history.push_back(quantum_energy);
+                                        chi_squared_history.push_back(chi_squared);
+                                        probs_history.push_back(probs);
+                                        params_history.push_back(cb_params);
+                                        current_energy = total_energy;
+                                        current_base_energy = quantum_energy;
+                                        current_chi_squared = chi_squared;
+                                        counts_values = probs;
+                                        current_iter = iter;
+                                        if (total_energy < best_energy)
+                                          best_energy = total_energy;
+                                      });
+                  adapt_sim.run_adapt();
+
+                  std::lock_guard<std::mutex> lock(graph_mutex);
+                  is_running = false;
+                  status_message = "ADAPT-VQE Termine.";
+                } else {
+                  ctx = std::make_unique<VQEContext>(physics, *ansatz);
+                  ctx->n_shots = shots;
+                  ctx->lambda = current_lambda;
+                  
+                  ctx->grad_method = chosen_grad_method;
+                  ctx->fd_tol = current_fd_tol;
+                  
+                  ctx->setup(factors_path, integrals_path);
 
                 sim = std::make_unique<Simulation>(*ctx, selected_algo);
                 if (is_spsa) {

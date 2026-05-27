@@ -214,12 +214,20 @@ if(BUILD_CLI)
         ${CMAKE_SOURCE_DIR}/src/scripts/generate_1rdm.py
         $<TARGET_FILE_DIR:quantum_cli>/python/generate_1rdm.py
     )
-    # Copie le script Python pour la generation d'Hamiltonien
+    # Copie le script Python pour la generation de la 2RDM (le commentaire original disait Hamiltonien, oups)
     add_custom_command(TARGET quantum_cli POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:quantum_cli>/python
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${CMAKE_SOURCE_DIR}/src/scripts/generate_2rdm.py
         $<TARGET_FILE_DIR:quantum_cli>/python/generate_2rdm.py
+    )
+
+    # Copie le script Python pour la generation du pool
+    add_custom_command(TARGET quantum_cli POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:quantum_cli>/python
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_SOURCE_DIR}/src/scripts/generate_pool.py
+        $<TARGET_FILE_DIR:quantum_cli>/python/generate_pool.py
     )
 else()
     message(STATUS "Skipping CLI build (Focus on GUI).")
@@ -344,12 +352,20 @@ if(BUILD_GUI)
         ${CMAKE_SOURCE_DIR}/src/scripts/generate_1rdm.py
         $<TARGET_FILE_DIR:quantum_gui>/python/generate_1rdm.py
     )
-    # Copie le script Python pour la generation d'Hamiltonien
+    # Copie le script Python pour la generation de la 2RDM
     add_custom_command(TARGET quantum_gui POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:quantum_gui>/python
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${CMAKE_SOURCE_DIR}/src/scripts/generate_2rdm.py
         $<TARGET_FILE_DIR:quantum_gui>/python/generate_2rdm.py
+    )
+
+    # Copie le script Python pour la generation du pool
+    add_custom_command(TARGET quantum_gui POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:quantum_gui>/python
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_SOURCE_DIR}/src/scripts/generate_pool.py
+        $<TARGET_FILE_DIR:quantum_gui>/python/generate_pool.py
     )
 
 else()

@@ -134,6 +134,8 @@ class HEA : public Ansatz {
 private:
   int num_qubits; ///< Number of qubits.
   int depth;      ///< Number of layers.
+  bool include_hf; ///< Flag to include Hartree-Fock part
+  int num_electrons; ///< Number of electrons (used for HF part)
 
 public:
   /**
@@ -141,8 +143,11 @@ public:
    *
    * @param num_qubits Number of qubits.
    * @param depth Depth of the ansatz (number of layers).
+   * @param include_hf Whether to include HF state initialization.
+   * @param num_electrons Number of electrons in the system.
    */
-  HEA(int num_qubits, int depth) : num_qubits(num_qubits), depth(depth) {}
+  HEA(int num_qubits, int depth, bool include_hf = false, int num_electrons = 0)
+      : num_qubits(num_qubits), depth(depth), include_hf(include_hf), num_electrons(num_electrons) {}
 
   void
   construct_circuit(Qureg qubits, const std::vector<double> &params,

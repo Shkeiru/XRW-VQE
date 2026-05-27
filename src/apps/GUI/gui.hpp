@@ -152,6 +152,10 @@ private:
   int shots = 1024;        ///< Number of shots for quantum measurement.
   double tolerance = 1e-8; ///< Tolerance for convergence.
   
+  int grad_method_idx = 1; ///< Default to PSR
+  std::vector<const char *> grad_methods = {"Finite Difference", "PSR", "Generalized PSR"};
+  double fd_tol = 1e-4;    ///< Tolerance for Finite Difference
+
   // SPSA Hyperparameters
   double spsa_a = 0.1;
   double spsa_c = 0.1;
@@ -204,6 +208,7 @@ private:
   ImVec4 graph_bg_color =
       ImVec4(0.1f, 0.1f, 0.1f, 1.0f); ///< Background color for plots.
   int hea_depth = 3;                  ///< Depth of the HEA ansatz.
+  bool hea_include_hf = false;        ///< Flag to include HF part in HEA ansatz.
   bool log_scale_P =
       false; ///< Flag for logarithmic scale in probability plots.
   bool log_scale_E = false; ///< Flag for logarithmic scale in energy plots.

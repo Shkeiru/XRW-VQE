@@ -282,23 +282,21 @@ double Simulation::cost_function(const std::vector<double> &params,
   // 1. Calculate the energy of the current point on the main register
   double base_energy = evaluate_functional(params, data, data->qubits, data->current_1rdm, &current_quantum_energy, &current_chi_squared, nullptr, true);
 
-  // 2. Calculate the local gradients using Parameter Shift Rule (PSR)
-  // Supports both standard PSR (M=1) and generalized PSR (M>1) for shared params
+  // 2. Calculate the local gradients
   if (!grad.empty()) {
     int num_params = params.size();
 
     // Query gate multiplicities once
     std::vector<int> multiplicities = data->ansatz.get_gate_multiplicities();
 
-    // One-time warning if shared parameters detected
-    static bool warned_shared = false;
-    if (!warned_shared) {
+    // One-time warning if PSR is selected but there are shared parameters
+    static bool warned_psr_multiplicity = false;
+    if (data->grad_method == GradientMethod::PSR && !warned_psr_multiplicity) {
       for (int m : multiplicities) {
         if (m > 1) {
-          spdlog::warn("[Simulation] Shared parameters detected (M > 1). "
-                       "Using Generalized PSR for gradient computation "
-                       "(2M evals/param instead of 2).");
-          warned_shared = true;
+          spdlog::warn("[Simulation] PSR selected with shared parameters (M > 1). "
+                       "Gradient might be incorrect. Consider using Generalized PSR (gPSR).");
+          warned_psr_multiplicity = true;
           break;
         }
       }
@@ -348,10 +346,19 @@ double Simulation::cost_function(const std::vector<double> &params,
           continue;
 
         try {
-          int M = multiplicities[i];
+          if (data->grad_method == GradientMethod::FD) {
+            // ── FINITE DIFFERENCES ──
+            std::vector<double> p_plus = params;
+            p_plus[i] += data->fd_tol;
+            double e_plus = evaluate_functional(p_plus, data, thread_qubits, rdm1_plus);
 
-          if (M == 1) {
-            // ── FAST PATH: standard PSR (unchanged, zero overhead) ──
+            std::vector<double> p_minus = params;
+            p_minus[i] -= data->fd_tol;
+            double e_minus = evaluate_functional(p_minus, data, thread_qubits, rdm1_minus);
+
+            grad[i] = (e_plus - e_minus) / (2.0 * data->fd_tol);
+          } else if (data->grad_method == GradientMethod::PSR || (data->grad_method == GradientMethod::gPSR && multiplicities[i] == 1)) {
+            // ── STANDARD PSR ──
             std::vector<double> shifted_params = params;
 
             // Shift +π/2
@@ -366,8 +373,9 @@ double Simulation::cost_function(const std::vector<double> &params,
 
             // Parameter Shift Rule formula
             grad[i] = 0.5 * (e_plus - e_minus);
-          } else {
+          } else if (data->grad_method == GradientMethod::gPSR) {
             // ── GENERALIZED PSR: sum over per-gate contributions ──
+            int M = multiplicities[i];
             double g_val = 0.0;
             for (int gate_idx = 0; gate_idx < M; ++gate_idx) {
               double e_plus = eval_shifted_thread(params, i, gate_idx, M_PI / 2.0);

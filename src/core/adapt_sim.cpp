@@ -50,14 +50,14 @@ std::vector<std::vector<GadgetInst>> OperatorPool::load_from_json(const std::str
 
 ADAPT_sim::ADAPT_sim(Physics& physics,
                      std::string optimizer_name, int max_evals, double vqe_tol, double adapt_epsilon,
-                     int n_shots, double lambda_val,
+                     int n_shots, double lambda_val, GradientMethod grad_method, double fd_tol,
                      std::string fcalc_path, std::string ft_int_path, std::string output_json_path,
                      int max_macro_iter,
                      std::function<void(int, double, double, double, const std::vector<double>&, const std::vector<double>&)> callback)
     : physics(physics),
       optimizer_name(optimizer_name), max_evals(max_evals), vqe_tol(vqe_tol), adapt_epsilon(adapt_epsilon),
       n_shots(n_shots), lambda_val(lambda_val), fcalc_path(fcalc_path), ft_int_path(ft_int_path),
-      output_json_path(output_json_path), max_macro_iter(max_macro_iter), callback(callback) {}
+      output_json_path(output_json_path), max_macro_iter(max_macro_iter), grad_method(grad_method), fd_tol(fd_tol), callback(callback) {}
 
 void ADAPT_sim::run_adapt() {
   spdlog::info("[ADAPT_sim] Starting ADAPT-VQE with epsilon={}", adapt_epsilon);
@@ -69,6 +69,8 @@ void ADAPT_sim::run_adapt() {
   VQEContext ctx(physics, ansatz);
   ctx.n_shots = n_shots;
   ctx.lambda = lambda_val;
+  ctx.grad_method = grad_method;
+  ctx.fd_tol = fd_tol;
   ctx.setup(fcalc_path, ft_int_path);
 
   // 3. Load Operator Pool
@@ -131,17 +133,56 @@ void ADAPT_sim::run_adapt() {
       for (int i = 0; i < (int)pool.size(); ++i) {
         thread_ansatz.add_operator(pool[i]);
         
-        std::vector<double> params_plus = current_params;
-        params_plus.push_back(3.14159265358979323846 / 2.0);
-        
-        std::vector<double> params_minus = current_params;
-        params_minus.push_back(-3.14159265358979323846 / 2.0);
-
         std::vector<qcomp> dummy_rdm;
-        double e_plus = Simulation::evaluate_functional(params_plus, &ctx, thread_qubits, dummy_rdm, nullptr, nullptr, &thread_ansatz);
-        double e_minus = Simulation::evaluate_functional(params_minus, &ctx, thread_qubits, dummy_rdm, nullptr, nullptr, &thread_ansatz);
+        double grad = 0.0;
 
-        double grad = 0.5 * (e_plus - e_minus);
+        if (grad_method == GradientMethod::FD) {
+          std::vector<double> params_plus = current_params;
+          params_plus.push_back(fd_tol);
+          std::vector<double> params_minus = current_params;
+          params_minus.push_back(-fd_tol);
+          
+          double e_plus = Simulation::evaluate_functional(params_plus, &ctx, thread_qubits, dummy_rdm, nullptr, nullptr, &thread_ansatz);
+          double e_minus = Simulation::evaluate_functional(params_minus, &ctx, thread_qubits, dummy_rdm, nullptr, nullptr, &thread_ansatz);
+          
+          grad = (e_plus - e_minus) / (2.0 * fd_tol);
+        } else if (grad_method == GradientMethod::PSR || (grad_method == GradientMethod::gPSR && pool[i].size() == 1)) {
+          std::vector<double> params_plus = current_params;
+          params_plus.push_back(3.14159265358979323846 / 2.0);
+          std::vector<double> params_minus = current_params;
+          params_minus.push_back(-3.14159265358979323846 / 2.0);
+          
+          double e_plus = Simulation::evaluate_functional(params_plus, &ctx, thread_qubits, dummy_rdm, nullptr, nullptr, &thread_ansatz);
+          double e_minus = Simulation::evaluate_functional(params_minus, &ctx, thread_qubits, dummy_rdm, nullptr, nullptr, &thread_ansatz);
+          
+          grad = 0.5 * (e_plus - e_minus);
+        } else if (grad_method == GradientMethod::gPSR) {
+          int M = pool[i].size();
+          double g_val = 0.0;
+          std::vector<double> p_zero = current_params;
+          p_zero.push_back(0.0);
+          int param_idx = current_params.size();
+
+          for (int gate_idx = 0; gate_idx < M; ++gate_idx) {
+            initZeroState(thread_qubits);
+            for (int e = 0; e < ctx.n_electrons; ++e) {
+              applyPauliX(thread_qubits, e);
+            }
+            thread_ansatz.construct_circuit_with_shift(thread_qubits, p_zero, ctx.paulis, param_idx, gate_idx, 3.14159265358979323846 / 2.0);
+            double e_plus = calcExpecPauliStrSum(thread_qubits, ctx.hamiltonian);
+
+            initZeroState(thread_qubits);
+            for (int e = 0; e < ctx.n_electrons; ++e) {
+              applyPauliX(thread_qubits, e);
+            }
+            thread_ansatz.construct_circuit_with_shift(thread_qubits, p_zero, ctx.paulis, param_idx, gate_idx, -3.14159265358979323846 / 2.0);
+            double e_minus = calcExpecPauliStrSum(thread_qubits, ctx.hamiltonian);
+
+            g_val += 0.5 * (e_plus - e_minus);
+          }
+          grad = g_val;
+        }
+
         gradients[i] = grad;
         thread_l2 += grad * grad;
 

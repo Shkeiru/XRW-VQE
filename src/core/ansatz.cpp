@@ -109,6 +109,13 @@ void HEA::construct_circuit(Qureg qubits, const std::vector<double> &params,
       applyControlledPauliZ(qubits, j, j + 1);
     }
   }
+
+  // 3. Hartree-Fock Initialization (Optional)
+  if (include_hf) {
+    for (int j = 0; j < num_electrons; ++j) {
+      applyPauliX(qubits, j);
+    }
+  }
 }
 
 int HEA::get_num_qubits() const { return num_qubits; }

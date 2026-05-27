@@ -45,12 +45,28 @@ def qubit_op_to_json_gadget(qubit_op):
         
     return {"gadgets": gadgets}
 
+def get_spin_flipped_op(op):
+    flipped_op = FermionOperator()
+    for term, coeff in op.terms.items():
+        flipped_term = tuple((idx ^ 1, action) for idx, action in term)
+        flipped_op += FermionOperator(flipped_term, coeff)
+    return flipped_op
+
+def canonical_key(op):
+    items = []
+    for term, coeff in sorted(op.terms.items()):
+        if abs(coeff) > 1e-8:
+            items.append((term, round(coeff.real, 5), round(coeff.imag, 5)))
+    return tuple(items)
+
 def generate_fermionic_pool(n_qubits, n_electrons):
     """
     Génère le pool avec les excitations simples (p, q) et doubles (p, q, r, s)
     en respectant l'approximation particule-trou.
+    Les opérateurs générés sont 'spin-complemented' (O + O_bar).
     """
     pool = []
+    seen = set()
     
     # Espace occupé (trous potentiels) et espace virtuel (particules potentielles)
     occ = range(n_electrons)
@@ -62,12 +78,17 @@ def generate_fermionic_pool(n_qubits, n_electrons):
         for q in occ:
             # Création de l'opérateur fermionique anti-hermitien
             op = FermionOperator(f'{p}^ {q}') - FermionOperator(f'{q}^ {p}')
+            op_sc = op + get_spin_flipped_op(op)
             
-            # Transformation en qubits via Jordan-Wigner
-            qubit_op = jordan_wigner(op)
-            
-            # Ajout au pool dans ton format
-            pool.append(qubit_op_to_json_gadget(qubit_op))
+            key = canonical_key(op_sc)
+            if key not in seen and op_sc.terms:
+                seen.add(key)
+                # Transformation en qubits via Jordan-Wigner
+                qubit_op = jordan_wigner(op_sc)
+                
+                # Ajout au pool dans ton format
+                if qubit_op.terms:
+                    pool.append(qubit_op_to_json_gadget(qubit_op))
             
     # 2. Excitations Doubles : p^ q^ r s - s^ r^ q p
     # Deux électrons sautent de r, s (occupés) vers p, q (virtuels)
@@ -82,11 +103,16 @@ def generate_fermionic_pool(n_qubits, n_electrons):
                         continue # Ordre strict (r > s)
                         
                     op = FermionOperator(f'{p}^ {q}^ {r} {s}') - FermionOperator(f'{s}^ {r}^ {q} {p}')
-                    qubit_op = jordan_wigner(op)
+                    op_sc = op + get_spin_flipped_op(op)
                     
-                    # Optionnel mais propre : si l'opérateur est vide après simplification, on l'ignore
-                    if qubit_op.terms: 
-                        pool.append(qubit_op_to_json_gadget(qubit_op))
+                    key = canonical_key(op_sc)
+                    if key not in seen and op_sc.terms:
+                        seen.add(key)
+                        qubit_op = jordan_wigner(op_sc)
+                        
+                        # Optionnel mais propre : si l'opérateur est vide après simplification, on l'ignore
+                        if qubit_op.terms: 
+                            pool.append(qubit_op_to_json_gadget(qubit_op))
                     
     return pool
 
@@ -99,10 +125,10 @@ def main():
         
     pool_raw = generate_fermionic_pool(args.n_qubits, args.n_electrons)
     
-    with open("pool_fermionic.json", "w") as f:
+    with open("pool.json", "w") as f:
         json.dump({"pool": pool_raw}, f, indent=4)
         
-    print(f"Terminé. Génération de pool_fermionic.json avec {len(pool_raw)} vrais opérateurs de chimie quantique.")
+    print(f"Terminé. Génération de pool.json avec {len(pool_raw)} vrais opérateurs de chimie quantique.")
 
 if __name__ == "__main__":
     main()

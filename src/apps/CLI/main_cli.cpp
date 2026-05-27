@@ -114,6 +114,9 @@ int main(int argc, char **argv) {
   std::string opt_ansatz = "HEA";
   int opt_hea_depth = 1;
 
+  std::string opt_grad_method = "psr";
+  double opt_finite_tol = 1e-4;
+
   app.add_option("--optimizer", opt_optimizer, "NLopt algorithm or SPSA");
   app.add_option("--max-iter", opt_max_iter, "Maximum number of evaluations");
   app.add_option("--tolerance", opt_tolerance, "Relative tolerance");
@@ -121,6 +124,8 @@ int main(int argc, char **argv) {
                  "Number of shots for noise (0 = statevector)");
   app.add_option("--ansatz", opt_ansatz, "Ansatz type (HEA or UCCSD)");
   app.add_option("--hea-depth", opt_hea_depth, "Depth if Ansatz = HEA");
+  app.add_option("--grad-method", opt_grad_method, "Gradient Method (fd, psr, gpsr)")->check(CLI::IsMember({"fd", "psr", "gpsr"}));
+  app.add_option("--finite-tol", opt_finite_tol, "Tolerance for finite differences");
 
   // SPSA specific options
   double opt_spsa_a = 0.1;
@@ -263,10 +268,18 @@ int main(int argc, char **argv) {
     std::unique_ptr<VQEContext> ctx;
     std::unique_ptr<Simulation> sim;
 
+    GradientMethod chosen_grad_method = GradientMethod::PSR;
+    if (opt_grad_method == "fd") chosen_grad_method = GradientMethod::FD;
+    else if (opt_grad_method == "gpsr") chosen_grad_method = GradientMethod::gPSR;
+
     if (!opt_adapt) {
       ctx = std::make_unique<VQEContext>(physics, *ansatz);
       ctx->n_shots = opt_shots;
       ctx->lambda = opt_lambda;
+      
+      ctx->grad_method = chosen_grad_method;
+      ctx->fd_tol = opt_finite_tol;
+      
       ctx->setup(opt_factors, opt_integrals);
 
       // 5. Create Simulation
@@ -415,7 +428,8 @@ int main(int argc, char **argv) {
       if (opt_adapt) {
         ADAPT_sim adapt_sim(physics,
                             opt_optimizer, opt_max_iter, opt_tolerance, opt_adapt_tol,
-                            opt_shots, opt_lambda, opt_factors, opt_integrals,
+                            opt_shots, opt_lambda, chosen_grad_method, opt_finite_tol,
+                            opt_factors, opt_integrals,
                             opt_out, opt_adapt_max_iter,
                             callback);
         adapt_sim.run_adapt();

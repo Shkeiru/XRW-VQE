@@ -64,6 +64,16 @@ struct RDM2Term {
 //------------------------------------------------------------------------------
 
 /**
+ * @enum GradientMethod
+ * @brief Enum for selecting the gradient evaluation method.
+ */
+enum class GradientMethod {
+  FD,     // Finite Differences
+  PSR,    // Parameter Shift Rule
+  gPSR    // Generalized Parameter Shift Rule
+};
+
+/**
  * @class VQEContext
  * @brief Manages the data and resources required for a VQE evaluation.
  *
@@ -84,6 +94,9 @@ public:
   std::function<void(int, double, double, double, const std::vector<double> &,
                      const std::vector<double> &)>
       callback;
+
+  GradientMethod grad_method = GradientMethod::PSR;
+  double fd_tol = 1e-4;
 
   int current_iter = 0; ///< Current iteration counter.
   int n_electrons = 0;  ///< Number of electrons in the system.
